@@ -73,7 +73,8 @@ def main() -> int:
         help=(
             "翻译通道（默认取 IMGTRANS_TRANSLATOR）："
             "web/api/free=免费 web 接口（机房 IP 会被 429 限流）；"
-            "cloud/nmt=官方 Cloud Translation v2（需 API Key，稳定）"
+            "cloud/nmt=官方 Cloud Translation v2（需 API Key，稳定）；"
+            "baidu=百度通用文本翻译（需 IMGTRANS_BAIDU_APPID + IMGTRANS_BAIDU_SECRET）"
         ),
     )
     parser.add_argument(
@@ -142,14 +143,36 @@ def main() -> int:
     google_key = os.environ.get("IMGTRANS_GOOGLE_KEY")
     google_credentials = os.environ.get("IMGTRANS_GOOGLE_CREDENTIALS")
     google_project = os.environ.get("IMGTRANS_GOOGLE_PROJECT")
+    baidu_appid = os.environ.get("IMGTRANS_BAIDU_APPID")
+    baidu_secret = os.environ.get("IMGTRANS_BAIDU_SECRET")
+    # 百度**不继承** IMGTRANS_PROXY：那个变量通常是给 Google 配的海外代理，
+    # 百度走海外出口反而会被判定为境外 IP（58000 客户端 IP 非法），
+    # 或者凭空多绕一圈。要代理请单独设 IMGTRANS_BAIDU_PROXY。
+    channel_proxy = args.proxy
+    if (args.translator or "").strip().lower() in ("baidu", "baidu_api"):
+        channel_proxy = os.environ.get("IMGTRANS_BAIDU_PROXY") or None
+    # 标准版 1 QPS，高级版 10 QPS。写错值不该让服务起不来——退到 1 更安全，
+    # 但要提示，否则"我明明写了 10 却没提速"会变成一次无效排查。
+    raw_qps = (os.environ.get("IMGTRANS_BAIDU_QPS") or "").strip()
+    try:
+        baidu_qps = float(raw_qps) if raw_qps else 1.0
+    except ValueError:
+        print(
+            f"提示：IMGTRANS_BAIDU_QPS={raw_qps!r} 不是数字，按 1.0 处理",
+            file=sys.stderr,
+        )
+        baidu_qps = 1.0
     try:
         translator = build_translator(
             args.translator,
-            proxy=args.proxy,
+            proxy=channel_proxy,
             timeout=20,
             google_key=google_key,
             google_credentials=google_credentials,
             google_project=google_project,
+            baidu_appid=baidu_appid,
+            baidu_secret=baidu_secret,
+            baidu_qps=baidu_qps,
         )
     except ValueError as exc:
         print(f"拒绝启动：{exc}", file=sys.stderr)
@@ -179,11 +202,12 @@ def main() -> int:
     # 设备确认之后才报监听地址：日志顺序就是启动顺序，
     # 先喊"监听中"再因为设备配错退出，会让人以为服务起过又挂了。
     logging.info(
-        "监听 %s:%s，翻译通道 %s，OCR 档位 %s，代理 %s，鉴权 %s",
+        "监听 %s:%s，翻译通道 %s，OCR 档位 %s，翻译代理 %s，图片下载代理 %s，鉴权 %s",
         args.host,
         args.port,
         getattr(translator, "kind", args.translator),
         ocr_profile,
+        channel_proxy or "无",
         args.proxy or "无",
         "关闭（--dev）" if args.dev else "开启",
     )

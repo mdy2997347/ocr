@@ -11,6 +11,10 @@
     # 指定源语言 / 首选通道 / 关闭限流
     python -m imgtrans.translator.cli --target zh-CN --source en --prefer free --qps 1 "hi"
 
+    # 百度通道（凭证也可用 IMGTRANS_BAIDU_APPID / IMGTRANS_BAIDU_SECRET 环境变量）
+    python -m imgtrans.translator.cli --kind baidu --target en \
+        --appid 2023xxxxxxxxx --secret xxxxx "你好"
+
 输出默认为 JSON（保持输入顺序），便于脚本消费；``--plain`` 则逐行输出译文。
 """
 
@@ -19,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from typing import Sequence
 
@@ -33,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     """构造参数解析器。"""
     parser = argparse.ArgumentParser(
         prog="python -m imgtrans.translator.cli",
-        description="Google 翻译通道命令行验证工具（imgtrans 翻译层）",
+        description="翻译通道命令行验证工具（imgtrans 翻译层）",
     )
     parser.add_argument(
         "texts",
@@ -56,8 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--kind",
         "-k",
         default="web",
-        choices=["web", "api", "free", "cloud", "nmt"],
+        choices=["web", "api", "free", "cloud", "nmt", "baidu", "baidu_api"],
         help="翻译通道（默认 web）",
+    )
+    parser.add_argument(
+        "--appid",
+        default=None,
+        help="百度通道 APP ID（默认取 IMGTRANS_BAIDU_APPID），纯数字，不是密钥",
+    )
+    parser.add_argument(
+        "--secret",
+        default=None,
+        help="百度通道密钥（默认取 IMGTRANS_BAIDU_SECRET）",
     )
     parser.add_argument(
         "--prefer",
@@ -132,6 +147,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         kwargs["proxy"] = args.proxy
     if args.prefer and args.kind in ("web", "api", "free"):
         kwargs["prefer"] = args.prefer
+    if args.kind in ("baidu", "baidu_api"):
+        # 命令行优先，其次环境变量；都没有就让构造器抛 ValueError，
+        # 那里给的提示比"签名错误 54001"有用得多。
+        kwargs["appid"] = args.appid or os.environ.get("IMGTRANS_BAIDU_APPID", "")
+        kwargs["secret"] = args.secret or os.environ.get("IMGTRANS_BAIDU_SECRET", "")
 
     translator = get_translator(args.kind, **kwargs)
     results = translator.translate_batch(texts, args.source, args.target)

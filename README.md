@@ -67,7 +67,11 @@ uv run python scripts/serve.py --port 8000
 | `IMGTRANS_PROXY` | 空 | 访问 Google / 下载图片用的代理，服务器能直连则留空 |
 | `IMGTRANS_HOST` / `IMGTRANS_PORT` | `127.0.0.1` / `8000` | 监听地址 |
 | `IMGTRANS_DEVICE` | `cpu` | `cpu` / `gpu` / `gpu:0` / `auto`（有卡用卡，无卡回落） |
-| `IMGTRANS_TRANSLATOR` | `web` | `web`（免费通道，机房 IP 易被 429）/ `cloud`（官方 v2，需 Key） |
+| `IMGTRANS_TRANSLATOR` | `web` | `web`（免费通道，机房 IP 易被 429）/ `cloud`（官方 v2，需 Key）/ `baidu`（百度通用文本翻译） |
+| `IMGTRANS_GOOGLE_KEY` / `_CREDENTIALS` / `_PROJECT` | 空 | `cloud` 通道凭证 |
+| `IMGTRANS_BAIDU_APPID` / `_SECRET` | 空 | `baidu` 通道凭证。APP ID 是**纯数字**，密钥是另一串，混填报 `54001` |
+| `IMGTRANS_BAIDU_QPS` | `1` | 百度标准版只有 1 QPS，高级版可设 10 |
+| `IMGTRANS_BAIDU_PROXY` | 空 | 百度通道专用代理。**不继承** `IMGTRANS_PROXY`（那是给 Google 出海用的） |
 | `IMGTRANS_OCR_PROFILE` | `quality` | `quality` / `fast`（只换检测模型，CPU 上快一倍，见下） |
 | `IMGTRANS_OCR_DET_SIDE_LEN` | 空 | 检测长边上限，默认 736；调小约再快 15%，密集小字会漏 |
 | `IMGTRANS_FONT_DIRS` | 空 | 额外字体目录，多个用 `;` 或 `:` 分隔 |
@@ -80,6 +84,40 @@ uv run python scripts/serve.py --port 8000
 看 `/healthz` 有没有 `ocr_fallback: true`，或日志里 `Creating model` 的模型名。
 
 `.env` 里有真实密钥，已被 `.gitignore` 排除。仓库里只有 `.env.example`。
+
+### 百度翻译通道
+
+机房直连 Google 常吃 429（表现为接口 200 但图片还是中文），切 `baidu` 可以绕开：
+
+```bash
+IMGTRANS_TRANSLATOR=baidu
+IMGTRANS_BAIDU_APPID=2023xxxxxxxxxxxxx   # 纯数字，不是密钥
+IMGTRANS_BAIDU_SECRET=xxxxxxxxxxxxxxxxx
+```
+
+APP ID 与密钥都在「百度翻译开放平台 → 管理控制台 → 我的服务」里，同一行并列显示。
+链接：<https://fanyi-api.baidu.com/manage/developer>
+
+百度按请求里 `\n` 分行返回，每行带 `src` 原文，所以**一次请求就能翻完一张图的所有文本块**，
+比免费 web 通道稳（不会被合并/拆句），往返次数从几十次降到一两次。
+标准版限 1 QPS、单次 `q` 不超过 6000 字节，超了会拿到 `54003` / `54005`。
+
+排错看两个地方：`/healthz` 的 `translator_last_error`（带错误码与中文解释），
+以及日志里的 `circuit_open`。凭证类错误（`54001` 签名错、`52003` 未授权、
+`54004` 余额不足、`58000` IP 白名单）连续 3 次会熔断 5 分钟——
+改完配置要重启服务才会解除。
+
+**`54001` 有两种含义**（实测确认）：签名错（APP ID 与密钥不配对），
+或者该 APP ID 没开通通用文本翻译 / 没开通这个语言方向——百度在这两种情况下
+回的是同一个码。先用 `apple` 试 `en→zh`（最容易通过的方向）：
+
+```bash
+IMGTRANS_BAIDU_SECRET=xxx python -m imgtrans.translator.cli \
+  --kind baidu --appid 2023xxxxxxxxx --target zh --source en "apple"
+```
+
+返回译文说明凭证没问题，问题在语言方向；仍回 `54001` 基本就是密钥抄错了
+（去 <https://fanyi-api.baidu.com/manage/developer> 重新复制整串）。
 
 ## 命令行
 

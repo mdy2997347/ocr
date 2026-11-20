@@ -858,14 +858,23 @@ IMGTRANS_API_KEY=${API_KEY}
 # 千万不要照抄开发机的 127.0.0.1:10809 —— 线上没有那个代理，症状是"翻译全部超时"。
 IMGTRANS_PROXY=
 
-# 翻译通道：web（免费 web 接口）/ cloud（官方 Cloud Translation v2）。
+# 翻译通道：web（免费 web 接口）/ cloud（官方 Cloud Translation v2）/ baidu（百度通用文本翻译）。
 # 免费通道抓的是 Google 网页接口，**机房 IP 会被 429 限流**，症状是接口返回
-# 200 + 一张原封不动的中文图，日志里只有 circuit_open。生产建议用 cloud。
+# 200 + 一张原封不动的中文图，日志里只有 circuit_open。生产建议用 cloud 或 baidu。
 IMGTRANS_TRANSLATOR=web
 # cloud 通道凭证（用 cloud 时取消注释；另外还需把 google-cloud-translate 加进依赖）：
 # IMGTRANS_GOOGLE_KEY=
 # IMGTRANS_GOOGLE_CREDENTIALS=
 # IMGTRANS_GOOGLE_PROJECT=
+# baidu 通道凭证（用 baidu 时取消注释）：APP ID 是「管理控制台 → 我的服务」
+# 里那串**纯数字**，密钥是同一行的另一串（不是 APP ID，混填会报 54001 签名错误）。
+# IMGTRANS_BAIDU_APPID=
+# IMGTRANS_BAIDU_SECRET=
+# 百度通道的 QPS：标准版只有 1，高级版可设 10。写大了只会拿到 54003。
+# IMGTRANS_BAIDU_QPS=1
+# 百度通道的代理。**默认不继承 IMGTRANS_PROXY**——那个通常是给 Google 配的
+# 海外代理，百度走它会被判境外 IP（58000）或白绕一圈。确实需要再填。
+# IMGTRANS_BAIDU_PROXY=
 
 # 监听地址：只监听回环，由 nginx 反代，不直接对公网暴露服务端口。
 # （若不用 nginx 又要被外部访问，改成 0.0.0.0，并自己承担鉴权/限流）

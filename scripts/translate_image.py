@@ -12,6 +12,9 @@
     # 指定代理（本机 Google 需代理）
     python scripts/translate_image.py --input a.png --to ja --proxy http://127.0.0.1:10809
 
+    # 换翻译通道（cloud 需 IMGTRANS_GOOGLE_KEY，baidu 需 IMGTRANS_BAIDU_APPID/_SECRET）
+    python scripts/translate_image.py --input a.png --to en --translator baidu
+
     # 只看识别与翻译结果，不落盘
     python scripts/translate_image.py --input a.png --to en --dry-run
 
@@ -32,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from imgtrans.device import DeviceError, resolve_device
 from imgtrans.env import apply_model_dir, load_env
 from imgtrans.pipeline import ImageTranslatePipeline, PipelineConfig
-from imgtrans.translator import get_translator
+from imgtrans.translator import build_translator
 from imgtrans.types import ImageTranslateError
 
 load_env()
@@ -59,6 +62,11 @@ def main() -> int:
     )
     parser.add_argument("--format", default="png", choices=["png", "jpeg", "webp"], help="输出格式")
     parser.add_argument(
+        "--translator",
+        default=os.environ.get("IMGTRANS_TRANSLATOR") or "web",
+        help="翻译通道（默认取 IMGTRANS_TRANSLATOR）：web/api/free / cloud / baidu",
+    )
+    parser.add_argument(
         "--device",
         default=os.environ.get("IMGTRANS_DEVICE") or "cpu",
         help="推理设备：cpu（默认）/ gpu / gpu:0 / auto",
@@ -73,7 +81,37 @@ def main() -> int:
         print(f"[{exc.code}] {exc}", file=sys.stderr)
         return 2
 
-    translator = get_translator("web", proxy=args.proxy, timeout=20)
+    # 与 serve.py 保持同一条规则：百度通道不继承 IMGTRANS_PROXY。
+    # 那个变量是给 Google 出海用的海外代理，百度走它会被判境外 IP（58000）。
+    kind = (args.translator or "web").strip().lower()
+    channel_proxy = args.proxy
+    if kind in ("baidu", "baidu_api"):
+        channel_proxy = os.environ.get("IMGTRANS_BAIDU_PROXY") or None
+
+    raw_qps = (os.environ.get("IMGTRANS_BAIDU_QPS") or "").strip()
+    try:
+        baidu_qps = float(raw_qps) if raw_qps else 1.0
+    except ValueError:
+        print(f"提示：IMGTRANS_BAIDU_QPS={raw_qps!r} 不是数字，按 1.0 处理", file=sys.stderr)
+        baidu_qps = 1.0
+
+    try:
+        translator = build_translator(
+            kind,
+            proxy=channel_proxy,
+            timeout=20,
+            google_key=os.environ.get("IMGTRANS_GOOGLE_KEY"),
+            google_credentials=os.environ.get("IMGTRANS_GOOGLE_CREDENTIALS"),
+            google_project=os.environ.get("IMGTRANS_GOOGLE_PROJECT"),
+            baidu_appid=os.environ.get("IMGTRANS_BAIDU_APPID"),
+            baidu_secret=os.environ.get("IMGTRANS_BAIDU_SECRET"),
+            baidu_qps=baidu_qps,
+        )
+    except ValueError as exc:
+        # 通道名拼错、百度缺凭证都属于"配置不对"，不该甩堆栈。
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 2
+
     pipeline = ImageTranslatePipeline(
         translator,
         config=PipelineConfig(output_format=args.format, device=device),

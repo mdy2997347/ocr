@@ -23,6 +23,7 @@ from __future__ import annotations
 
 __all__ = [
     "AUTO_LIST",
+    "BAIDU_LANGS",
     "CONVERT_CODES",
     "SUPPORTED_LANGS",
     "is_supported_lang",
@@ -31,6 +32,7 @@ __all__ = [
     "convert_lang",
     "convert_lang_code",
     "is_supported_source",
+    "to_baidu_lang",
 ]
 
 #: 对外支持的**目标**语言码（业务口径，顺序即文档顺序）。
@@ -122,6 +124,70 @@ CONVERT_CODES: dict[str, tuple[str, ...]] = {
 
 #: ``AUTO_LIST`` 的小写键索引，供 :func:`lookup_auto` 做大小写无关匹配。
 _AUTO_LIST_LOWER: dict[str, str] = {key.lower(): value for key, value in AUTO_LIST.items()}
+
+#: 本项目规范码 → 百度翻译语言码。
+#:
+#: 百度**不用** ISO 639-1，混用会拿到 ``58001 译文语言方向不支持``：
+#: 日语是 ``jp`` 不是 ``ja``，韩语是 ``kor`` 不是 ``ko``，法语是 ``fra``
+#: 不是 ``fr``，西班牙语是 ``spa`` 不是 ``es``……这张表逐个核对过官方文档。
+#:
+#: 与 :data:`AUTO_LIST` 的另一个关键差异：``he`` 在这里是 ``heb``，
+#: 而 Google 那边要的是废弃码 ``iw``。**两套映射不能互相借用**。
+BAIDU_LANGS: dict[str, str] = {
+    "en": "en",
+    "ar": "ara",
+    "bg": "bul",
+    "bn": "ben",
+    "cs": "cs",
+    "da": "dan",
+    "de": "de",
+    "el": "el",
+    "es": "spa",
+    "et": "est",
+    "fi": "fin",
+    "fr": "fra",
+    "he": "heb",
+    "hi": "hi",
+    "hr": "hrv",
+    "hu": "hu",
+    "id": "id",
+    "it": "it",
+    "ja": "jp",
+    "ka": "geo",
+    "ko": "kor",
+    "ms": "may",
+    "nl": "nl",
+    "no": "nor",
+    "pl": "pl",
+    "pt": "pt",
+    "ro": "rom",
+    "ru": "ru",
+    "sk": "slo",
+    "sl": "slv",
+    "sv": "swe",
+    "th": "th",
+    "tr": "tr",
+    "uk": "ukr",
+    "vi": "vie",
+}
+
+#: 只用于**源**语言（或百度的特殊码）的映射。
+#:
+#: 中文不在 :data:`SUPPORTED_LANGS` 里——本服务只把中文当源语言。
+#: ``zh-tw`` / ``zh-hk`` 在百度那边叫 ``cht``（繁体），不是 ``zh-TW``。
+#: ``yue``（粤语）/ ``wyw``（文言文）是百度独有的码，调用方直接传也能过。
+_BAIDU_SOURCE_ALIASES: dict[str, str] = {
+    "auto": "auto",
+    "zh": "zh",
+    "zh-cn": "zh",
+    "zh-hans": "zh",
+    "zh-tw": "cht",
+    "zh-hk": "cht",
+    "zh-hant": "cht",
+    "cht": "cht",
+    "yue": "yue",
+    "wyw": "wyw",
+}
 
 
 def normalize_lang(code: str | None) -> str:
@@ -236,3 +302,31 @@ def is_supported_source(code: str | None) -> bool:
         是否支持。
     """
     return lookup_auto(code) is not None
+
+
+def to_baidu_lang(code: str | None) -> str:
+    """把语言码转成百度翻译认的码。
+
+    接受 ``EN`` / `` en `` / ``ja-JP`` / ``zh`` / ``auto`` 等形式。
+    先用完整码查 :data:`BAIDU_LANGS` 与 :data:`_BAIDU_SOURCE_ALIASES`，
+    再退到主语言子标签（``ja-JP`` → ``ja`` → ``jp``）。
+
+    Args:
+        code: 语言代码。
+
+    Returns:
+        百度语言码；无法映射返回 ``""``（调用方据此报错或回落 ``auto``）。
+    """
+    if not code or not isinstance(code, str):
+        return ""
+    key = code.strip().lower().replace("_", "-")
+    if not key:
+        return ""
+    if key in _BAIDU_SOURCE_ALIASES:
+        return _BAIDU_SOURCE_ALIASES[key]
+    if key in BAIDU_LANGS:
+        return BAIDU_LANGS[key]
+    primary = key.split("-", 1)[0]
+    if primary in _BAIDU_SOURCE_ALIASES:
+        return _BAIDU_SOURCE_ALIASES[primary]
+    return BAIDU_LANGS.get(primary, "")
