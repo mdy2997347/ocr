@@ -1,0 +1,79 @@
+# requirements.lock.txt —— 精确锁定（唯一版本真源）
+#
+# 项目：多语言图片翻译服务（imgtrans）
+# 生成口径：python -m pip index versions <pkg> 逐条核实（2026-11-19），取当时最新稳定版
+# 生成方式：当前为「依据核实结果预填的直接依赖精确 pin」。
+#           项目 venv 建好后，应以实际 freeze 结果覆盖本文件（含传递依赖）：
+#               python -m venv .venv && . .venv/bin/activate
+#               pip install -r requirements.txt
+#               pip freeze > requirements.lock.txt
+# 用途：生产镜像安装用 `pip install -r requirements.lock.txt`（不用 requirements.txt）
+#
+# ⚠️ 本文件已经不是「唯一真源」：项目现在用 uv 管理环境，真正锁定的是
+#    pyproject.toml（声明） + uv.lock（解析结果，含 98 个传递依赖和 hash）。
+#    本文件保留给 pip 路径（客户现网习惯、离线 wheel 安装），内容按 pyproject 对齐。
+#    两者冲突时以 pyproject.toml / uv.lock 为准。
+#
+#    本文件是「手工 pin 的直接依赖」，不含传递依赖，因此**不保证可复现**——
+#    实测过一次：numpy 曾写死 2.5.5，与 paddleocr 的 paddlex 依赖冲突，直接装不上。
+#    要真正可复现，请用：uv sync --frozen
+#
+# ⚠️ GPU 部署：`paddlepaddle`（CPU）与 `paddlepaddle-gpu` 互斥，装一个会卸掉另一个。
+#    GPU 版不在 PyPI 主索引，必须走官方索引（已核实 3.3.1 有 cp313 linux wheel）：
+#      pip install paddlepaddle-gpu==3.3.1 \
+#          -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+#    cu126 运行时对应驱动 >= 550.54.14。装完先确认：
+#      python -c "import paddle; print(paddle.device.is_compiled_with_cuda())"   # True
+#    再在 .env 设 IMGTRANS_DEVICE=gpu（或 auto）。
+#
+# ⚠️ torch / torchvision 当前代码 **0 处引用**（擦除走 OpenCV + PIL，未启用 LaMa）。
+#    只跑 CPU 服务时可跳过，省 2 GB+ 镜像体积：
+#      grep -v -E "^(torch|torchvision)==" requirements.lock.txt > req.txt
+#    将来真要上 LaMa，再从 PyTorch 索引装与 CUDA 匹配的版本：
+#      --index-url https://download.pytorch.org/whl/cu126
+
+# ---- Web ----
+fastapi==0.165.0
+uvicorn==0.54.0
+pydantic==2.14.3
+pydantic-settings==2.16.3
+python-multipart==0.0.34
+orjson==3.13.0
+httpx==0.28.1
+tenacity==9.2.1
+
+# ---- 图像 ----
+pillow==13.0.0
+# numpy 不能写死版本：paddlex 3.7.x 声明 numpy>=1.24,<2.4，
+# 写 numpy==2.5.5 会让整个解析失败（uv 直接报 unsatisfiable）。实测可用 2.3.5。
+numpy>=1.24,<2.4
+opencv-python-headless==5.1.0.95
+scipy==1.18.1
+shapely==2.2.0
+pyclipper==1.4.0
+
+# ---- OCR ----
+paddleocr==3.7.0
+paddlepaddle==3.3.1
+# GPU 版（从官方索引安装，PEP 517 下不写入本文件）：
+#   paddlepaddle-gpu==3.2.0
+
+# ---- 擦除 ----
+torch==2.15.0
+torchvision==0.29.2
+
+# ---- 基础设施 ----
+redis==8.1.0
+prometheus-client==0.26.0
+structlog==26.1.0
+langdetect==1.0.9
+
+# ============================================================
+# 开发/CI 依赖（独立文件 requirements-dev.txt，不用本文件锁定生产镜像）
+# ============================================================
+# pytest==9.2.0
+# pytest-asyncio==1.5.0
+# pytest-cov==7.1.0
+# respx==0.23.1
+# ruff==0.17.5
+# mypy==2.4.1

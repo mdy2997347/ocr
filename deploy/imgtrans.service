@@ -1,0 +1,89 @@
+# =============================================================================
+# imgtrans 图片翻译服务 —— systemd 单元模板
+#
+# 这是**模板**，不要直接拷到 /etc/systemd/system/。
+# deploy/install.sh 会用 sed 替换 @INSTALL_DIR@ / @RUN_USER@ / @RUN_GROUP@ 后安装：
+#   sed -e 's|@INSTALL_DIR@|/opt/imgtrans|g' ... deploy/imgtrans.service \
+#       > /etc/systemd/system/imgtrans.service
+#
+# 手工安装（不跑脚本）时：把三个占位符改成实际值、确认 ExecStart 里的 python 存在，
+# 然后 systemctl daemon-reload && systemctl enable --now imgtrans
+# =============================================================================
+
+[Unit]
+Description=imgtrans 多语言图片翻译服务（OCR -> 翻译 -> 回填）
+Documentation=file://@INSTALL_DIR@/docs/ubuntu-deploy.md
+# network-online：首次启动要下载模型（约 140MB），网络没就绪会白等一轮
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 降权：paddle 会解析不可信图片，绝不能用 root 跑
+User=@RUN_USER@
+Group=@RUN_GROUP@
+
+WorkingDirectory=@INSTALL_DIR@
+
+# HOME 指到安装目录：uv / paddle / matplotlib 之类都会往 $HOME 写缓存，
+# 而运行用户是 --no-create-home 建的（没有 /home/xxx），$HOME 若是 /nonexistent
+# 会得到一堆"只读文件系统/权限不足"的迷惑告警。
+Environment=HOME=@INSTALL_DIR@
+# 日志不缓冲：否则 journalctl 里要等缓冲区满才看到内容，排障时像卡死
+Environment=PYTHONUNBUFFERED=1
+# 不设 PADDLE_PDX_CACHE_HOME：模型目录由 .env 的 IMGTRANS_MODEL_DIR 决定，
+# systemd 的 Environment= 优先级高于 EnvironmentFile，写在这里会把 .env 顶掉。
+
+# 配置全部来自 .env（由 install.sh 生成，权限 600）。unit 里不硬编码业务配置，
+# 换端口/换 key/换代理只改 .env + systemctl restart。
+EnvironmentFile=@INSTALL_DIR@/.env
+
+# 用 venv 里的 python 绝对路径，而不是 `uv run`：
+#   * uv run 默认会先校验 lock 与环境差异，必要时联网 —— 线上启动不该依赖网络
+#   * 绝对路径不依赖 PATH，systemd 的 PATH 很短
+# 单进程：OCR 本身吃满 CPU/GPU，多 worker 只会各自加载一份模型抢资源。
+ExecStart=@INSTALL_DIR@/.venv/bin/python @INSTALL_DIR@/scripts/serve.py
+
+Restart=always
+RestartSec=3
+# uvicorn 收到 SIGTERM 后会等在途请求结束再退出；单图 12~20s，长图更久。
+# 30s 只够一个请求，重启瞬间若有 2 个在途就会 SIGKILL（调用方看到连接被重置）；
+# 给到 60s。整体停机时间上限 = 这个值，正常重启只需等在途请求跑完。
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# ---- 安全加固 ---------------------------------------------------------------
+# 全是"只会让攻击面变小、不影响正常跑"的选项；凡是可能影响推理的都已排除。
+NoNewPrivileges=yes
+PrivateTmp=yes
+# full = /usr /boot /efi /etc 只读（/opt、/srv 仍可写）
+ProtectSystem=full
+# 屏蔽 /home /root /run/user：服务只需要自己的安装目录
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+# 放行安装目录的写权限：模型目录、out/、以及 paddle 的临时文件都在这里。
+# ProtectSystem=full 下 /opt 本身可写，但显式声明一遍更清楚，
+# 万一以后把 ProtectSystem 提到 strict，这行就是唯一让服务还能写模型的地方。
+ReadWritePaths=@INSTALL_DIR@
+# 注意：**不要**开 PrivateDevices=yes。开了会隐藏 /dev/nvidia*，
+# GPU 机器上 paddle 会退化成"看不到显卡"，症状是启动报设备不可用。
+# PrivateDevices=no 是默认值，这里显式写出来防止后人误加。
+
+# 资源限制（按机器实际情况放开）。默认不限，避免小内存机器直接起不来。
+# MemoryMax=4G
+# CPUQuota=200%
+
+# ---- 日志 -------------------------------------------------------------------
+# 走 journald：journalctl -u imgtrans -f 即可，自动轮转，不用管日志文件权限
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=imgtrans
+
+[Install]
+WantedBy=multi-user.target

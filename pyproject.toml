@@ -1,0 +1,58 @@
+# imgtrans —— 多语言图片翻译服务
+#
+# 这份文件让项目可以用 uv 做「项目级隔离部署」：
+#     uv sync --extra cpu          # 建独立 .venv 并装齐依赖
+#     uv run python scripts/serve.py
+#
+# 与 requirements 文件的分工：
+#   pyproject.toml  声明「要什么」，是唯一需要人工维护的地方
+#   uv.lock         记录「实际装了什么」，由 `uv lock` 生成，不要手改
+#   requirements.*  交给 pip 的老路径，保留但不再是真源
+#
+# 版本策略：运行时依赖写精确 pin（与已验证版本一致），numpy 写区间——
+# paddlex 3.7.x 硬性要求 numpy<2.4，写死 2.5.x 会让解析直接失败。
+
+[project]
+name = "imgtrans"
+version = "0.1.0"
+description = "多语言图片翻译：OCR -> 段落聚合 -> 翻译 -> 擦除 -> 回填"
+# 下限 3.11 来自 fastapi 0.165：它声明 requires-python>=3.11；
+# 上限 3.13 来自 paddlepaddle 3.3.1：它只发 cp39~cp313 的 wheel，3.14 装了没轮子。
+requires-python = ">=3.11,<3.14"
+
+dependencies = [
+    # Web 层
+    "fastapi==0.165.0",
+    "uvicorn==0.54.0",
+    "pydantic==2.14.3",
+    "python-multipart==0.0.34",  # /v1/translate/upload 的 multipart 解析
+    "httpx==0.28.1",
+    # 图像层
+    "pillow==13.0.0",
+    "numpy>=1.24,<2.4",
+    "opencv-python-headless==5.1.0.95",
+    # OCR（paddlepaddle 本体见下方 extras：CPU/GPU 互斥，不能进默认依赖）
+    "paddleocr==3.7.0",
+]
+
+[project.optional-dependencies]
+# 二选一，必须显式指定：`uv sync --extra cpu` 或 `uv sync --extra gpu`
+cpu = ["paddlepaddle==3.3.1"]
+gpu = ["paddlepaddle-gpu==3.3.1"]
+
+# GPU 版 paddle 不在 PyPI，只能从官方源装；explicit=true 表示
+# 只给显式引用它的包用，不会污染其它包的解析。
+[[tool.uv.index]]
+name = "paddle-gpu"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
+explicit = true
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-gpu" }
+
+[tool.uv]
+# 应用项目，不对外提供包，跳过构建步骤（否则 uv sync 会尝试 build imgtrans）
+package = false
+# 声明 cpu / gpu 两组互斥：同时 `--extra cpu --extra gpu` 会直接报错，
+# 而不是装完互相卸载、留下一个半坏的环境。
+conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]

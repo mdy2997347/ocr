@@ -1,0 +1,344 @@
+%% 多语言图片翻译服务 —— 核心数据模型与类关系
+%% 对应文档：docs/image-translate-technical-design.md §7.1
+
+classDiagram
+    direction LR
+
+    class TranslateRequest {
+        +str image_url
+        +str image_base64
+        +str from_lang
+        +str to_lang
+        +RenderOptions render
+        +EraseOptions erase
+        +OcrOptions ocr
+        +TranslateOptions translate
+        +ReturnOptions return_opts
+        +str callback_url
+        +str request_id
+    }
+
+    class RenderOptions {
+        +str mode
+        +str text_background
+        +str stroke
+        +float font_scale_max
+        +str output_format
+        +int quality
+    }
+
+    class EraseOptions {
+        +str quality
+        +str engine
+    }
+
+    class OcrOptions {
+        +float min_confidence
+        +str vertical
+        +bool drop_non_linguistic
+    }
+
+    class TranslateOptions {
+        +str engine
+        +str glossary_id
+        +bool cache
+    }
+
+    class TranslateResponse {
+        +int code
+        +str message
+        +str request_id
+        +bool cached
+        +ResponseData data
+        +TimingStats timing_ms
+        +list~str~ warnings
+    }
+
+    class ResponseData {
+        +str from_lang
+        +str to_lang
+        +ImageMeta image
+        +list~TextBlock~ blocks
+        +TranslateStats stats
+    }
+
+    class ImageMeta {
+        +int width
+        +int height
+        +str format
+        +int size_bytes
+    }
+
+    class TranslateStats {
+        +int blocks_total
+        +int translated
+        +int failed
+        +int skipped
+        +int chars_sent
+        +int chunks
+    }
+
+    class TimingStats {
+        +int total
+        +int download
+        +int normalize
+        +int ocr
+        +int group
+        +int translate
+        +int mask
+        +int inpaint
+        +int style
+        +int render
+        +int encode
+        +int queue_wait
+    }
+
+    class TextBlock {
+        +int id
+        +str src
+        +str dst
+        +list polygon
+        +tuple rect
+        +int line_count
+        +bool vertical
+        +float confidence
+        +str mt_status
+        +BlockStyle style
+        +RenderPlan render
+        +bool fits()
+        +int area()
+    }
+
+    class BlockStyle {
+        +int font_size
+        +str color
+        +str weight
+        +bool italic
+        +str align
+        +StrokeSpec stroke
+        +BGSpec background
+    }
+
+    class StrokeSpec {
+        +str color
+        +int width
+    }
+
+    class BGSpec {
+        +str type
+        +list~str~ colors
+    }
+
+    class RenderPlan {
+        +int font_size
+        +float scale
+        +int lines
+        +int line_height
+        +bool overflow
+        +bool truncated
+        +bool compressed
+        +str degraded
+    }
+
+    class Pipeline {
+        +Semaphore gpu_fence
+        +run(req) TranslateResponse
+        -fetch(url) bytes
+        -normalize(raw) Image
+        -ocr(img, lang) RawLine[]
+        -group(lines) TextBlock[]
+        -translate(blocks, src, tgt) void
+        -erase(img, blocks, opt) Image
+        -analyze(img, blocks, mask) void
+        -render(img, blocks) Image
+        -encode(img, opt) bytes
+    }
+
+    class OcrEngine {
+        +dict~str,PaddleOCR~ engines
+        +warmup() void
+        +detect_and_recognize(img, lang) RawLine[]
+        +route_model(lang) str
+    }
+
+    class RawLine {
+        +list polygon
+        +str text
+        +float score
+    }
+
+    class BaseTranslator {
+        <<protocol>>
+        +translate_batch(texts, source, target) list~str~
+        +health() bool
+        +warmup() void
+    }
+
+    class GoogleWebTranslator {
+        -AsyncClient http
+        -TkkProvider tkk
+        -TokenBucket bucket
+        -EgressPool egress
+        -RetryPolicy retry
+        -bool _circuit_open
+        +bool circuit_open
+        +translate_batch(texts, source, target) list~str~
+        -_translate_api(chunk, src, tgt) list~str~
+        -_translate_free(chunk, src, tgt) list~str~
+        -_call_with_retry(chunk, src, tgt) list~str~
+        -_parse_multi_q(raw, expected) list~str~
+    }
+
+    class GoogleCloudTranslator {
+        +translate_batch(texts, source, target) list~str~
+    }
+
+    class Endpoint {
+        +str kind
+        +str value
+        +str region
+        +bool healthy
+        +float rtt_ms
+    }
+
+    class TkkProvider {
+        -str tkk
+        -float refreshed_at
+        -int tkk_ttl
+        -str fallback
+        +get(force) str
+        -_scrape() str
+    }
+
+    class TokenBucket {
+        +float rate
+        +int capacity
+        -float tokens
+        +acquire(n) void
+    }
+
+    class EgressPool {
+        +list~Endpoint~ endpoints
+        +pick() Endpoint
+        +report(ep, ok) void
+        +probe_loop() void
+    }
+
+    class RetryPolicy {
+        +int attempts
+        +int base_ms
+        +float factor
+        +int jitter_ms
+        +delay(n) float
+    }
+
+    class ChunkPlanner {
+        +prefilter(blocks) tuple
+        +plan_chunks(texts, idx, max_chars, max_items) list~Chunk~
+        +apply(results, chunk, out) void
+    }
+
+    class Chunk {
+        +int offset
+        +list~int~ block_idx
+        +list~str~ texts
+    }
+
+    class MaskGenerator {
+        +build(img, blocks) ndarray
+        -estimate_stroke_width(roi, mask) int
+        -sauvola(gray) ndarray
+    }
+
+    class InpaintEngine {
+        +erase(img, mask, quality) Image
+        -dispatch(roi, mask) str
+    }
+
+    class LamaInpainter {
+        +erase(img, mask) Image
+    }
+    class SDInpainter {
+        +erase(img, mask) Image
+    }
+    class AnalyticFiller {
+        +can_fill(roi, mask) bool
+        +fill(roi, mask) ndarray
+    }
+    class TeleaInpainter {
+        +erase(img, mask) Image
+    }
+
+    class StyleAnalyzer {
+        +analyze(img, blocks, mask) void
+        -estimate_foreground(roi, mask) tuple
+        -estimate_background(roi, mask) BGSpec
+        -estimate_align(lines) str
+    }
+
+    class Renderer {
+        +render(img, blocks) Image
+        +fit_text(text, box, style) RenderPlan
+        -_supersample_draw(block, plan) Image
+    }
+
+    class FontRegistry {
+        +dict registry
+        +get(lang, size, weight) ImageFont
+        +resolve_chain(lang) list~str~
+        +check_raqm() bool
+    }
+
+    class CacheStore {
+        +get_image(key) TranslateResponse
+        +set_image(key, val, ttl) void
+        +get_text(text, src, tgt) str
+        +set_text(text, src, tgt, val, ttl) void
+    }
+
+    TranslateRequest *-- RenderOptions
+    TranslateRequest *-- EraseOptions
+    TranslateRequest *-- OcrOptions
+    TranslateRequest *-- TranslateOptions
+
+    TranslateResponse *-- ResponseData
+    TranslateResponse *-- TimingStats
+    ResponseData *-- ImageMeta
+    ResponseData *-- TranslateStats
+    ResponseData *-- "1..*" TextBlock
+
+    TextBlock *-- BlockStyle
+    TextBlock *-- RenderPlan
+    BlockStyle *-- StrokeSpec
+    BlockStyle *-- BGSpec
+
+    Pipeline --> OcrEngine
+    Pipeline --> BaseTranslator
+    Pipeline --> MaskGenerator
+    Pipeline --> InpaintEngine
+    Pipeline --> StyleAnalyzer
+    Pipeline --> Renderer
+    Pipeline --> CacheStore
+
+    BaseTranslator <|.. GoogleWebTranslator
+    BaseTranslator <|.. GoogleCloudTranslator
+
+    GoogleWebTranslator --> TkkProvider
+    GoogleWebTranslator --> TokenBucket
+    GoogleWebTranslator --> EgressPool
+    EgressPool *-- "0..*" Endpoint
+    GoogleWebTranslator --> RetryPolicy
+    GoogleWebTranslator --> ChunkPlanner
+    ChunkPlanner ..> Chunk : creates
+
+    InpaintEngine <|.. LamaInpainter
+    InpaintEngine <|.. SDInpainter
+    InpaintEngine <|.. AnalyticFiller
+    InpaintEngine <|.. TeleaInpainter
+
+    Renderer --> FontRegistry
+
+    OcrEngine ..> RawLine : produces
+    OcrEngine ..> TextBlock : "transforms to"
+    StyleAnalyzer ..> TextBlock : "fills BlockStyle"
+    Renderer ..> TextBlock : reads

@@ -1,0 +1,173 @@
+%% 多语言图片翻译服务 —— 端到端时序图
+%% 对应文档：docs/image-translate-technical-design.md §2.3
+%% 参与者：PHP 业务站 / FastAPI / Cache / GPU队列 / Pipeline / OcrEngine
+%%         / GoogleWebTranslator / Google站点 / InpaintEngine / Renderer
+
+sequenceDiagram
+    autonumber
+    participant PHP as PHP业务站
+    participant API as FastAPI
+    participant Cache as CacheStore
+    participant Q as GPU队列
+    participant P as Pipeline
+    participant OCR as OcrEngine
+    participant MT as GoogleWebTranslator
+    participant EG as 海外出口_EgressPool
+    participant G as Google站点
+    participant INP as InpaintEngine
+    participant R as Renderer
+
+    PHP->>API: POST /v1/image/translate (HMAC签名 + body)
+    activate API
+    API->>API: 验签 / nonce查重 / 限流 / 参数校验
+
+    API->>Cache: get(sha256(url|to|render|erase))
+    activate Cache
+
+    alt 缓存命中
+        Cache-->>API: PipelineResult
+        API-->>PHP: 200 {code:0, cached:true, image, blocks}
+    else 缓存未命中
+        Cache-->>API: null
+        API->>Q: acquire() Semaphore(1) 超时30s
+        activate Q
+        Q->>P: run(TranslateRequest)
+        activate P
+
+        Note over P: ---- 1. 获取与规范化 ----
+        P->>P: fetch(url) 超时5s/重定向≤3/拒绝内网IP/≤10MB
+        P->>P: normalize() EXIF校正 / ICC→sRGB / alpha处理
+
+        Note over P,OCR: ---- 2. OCR ----
+        alt 边长 > 4096
+            P->>P: ocr_tiles(overlap=192px) 仅切OCR不动像素
+        end
+        P->>OCR: detect_and_recognize(img, lang_group)
+        activate OCR
+        OCR->>OCR: det (PP-OCRv6_medium_det)
+        OCR->>OCR: cls (textline_orientation 0°/180°)
+        OCR->>OCR: rec (PP-OCRv6_medium_rec / PP-OCRv5_multi)
+        OCR-->>P: RawLine[] {polygon, text, score}
+        deactivate OCR
+
+        P->>P: group_blocks() 分栏 + y重叠 + 间距 + 对齐
+        P->>P: filter() score<0.5 / 纯符号 / 纯数字不送翻译
+
+        Note over P,MT: ---- 3. 翻译（核心） ----
+        P->>MT: translate_batch(texts[], source, target)
+        activate MT
+        MT->>MT: prefilter() 空串/纯数字/低置信 → dst=原文
+        MT->>MT: plan_chunks(max_chars=4000, max_items=50)
+
+        MT->>MT: tkk_provider.get() (TTL 3600s)
+        alt TKK 缓存过期
+            MT->>EG: 取健康出口（代理/境外节点）
+            EG->>G: GET translate.google.com/ 抓 tkk
+            G-->>EG: html
+            EG-->>MT: 转发 → 正则提取 (kb, vb)
+            Note over MT: 抓取失败→沿用上次→内置常量(406398,2087938574)
+        end
+
+        loop 每个 chunk（顺序固定，不重排）
+            MT->>MT: bucket.acquire() 令牌桶 3QPS
+            MT->>MT: tk = calc_tk("".join(texts), tkk)
+            MT->>MT: egress.pick() 多网卡/代理
+            MT->>EG: 经代理发出（connect 3s / read 8s）
+            EG->>G: POST /translate_a/t?client=te&format=html&v=1.0&key&sl&tl&tc=3&ctt=1&tk
+            activate G
+
+            alt 403 / tk校验失败 / 空数组
+                G-->>EG: 403
+                EG-->>MT: 403
+                MT->>MT: refresh_tkk(force=True) 重试1次
+                MT->>EG: POST 重试（新tk）
+                EG->>G: POST 重试
+            else 429 / 503 / 超时
+                G-->>EG: 429/503/timeout
+                EG-->>MT: 429/503/timeout
+                MT->>MT: 指数退避 0.5s→1s→2s + 抖动 (≤3次)
+                MT->>EG: POST 重试（退避后）
+                EG->>G: POST 重试
+            end
+
+            G-->>EG: ["译文1","译文2",...]
+            EG-->>MT: 转发响应
+            deactivate G
+
+            MT->>MT: 校验 len(out)==len(chunk) 且元素均为str
+            alt 长度不匹配
+                Note over MT: 整批作废（E_ORDER P0告警）<br/>不猜顺序，绝不重排
+                MT->>MT: 该批全部置 None
+            else 长度匹配
+                MT->>MT: results[chunk.offset + j] = out[j]
+            end
+            MT->>MT: postprocess: html.unescape<br/>（无 ucfirst/strtolower）
+            MT->>MT: quality_gate: 长度比/脚本一致性/原样返回
+        end
+
+        alt 出口不可用（ConnectTimeout / 000）
+            MT->>MT: 端点 healthy=false，冷却 120s
+            MT->>EG: egress.pick() 取备用出口
+            Note over EG: 无可用出口 → 直接跳降级链<br/>（Google Cloud 同样需出口，仍不可达）
+        end
+
+        alt 主通道整批失败
+            MT->>EG: 降级 free 通道 (client=at, 逐块1请求)
+            EG->>G: POST /translate_a/single
+            G-->>EG: sentences[].trans
+            EG-->>MT: 转发
+        end
+        alt 全部降级失败
+            MT->>MT: 该块 dst=src, mt_status=failed
+        end
+
+        MT-->>P: translations[] (长度==blocks，失败位=原文)
+        deactivate MT
+
+        Note over P,INP: ---- 4. 擦除 ----
+        P->>P: build_mask() Sauvola + 闭运算 + 膨胀(≥描边宽)
+        P->>INP: erase(img, mask, quality)
+        activate INP
+        alt 环带方差<6 或 可拟合线性渐变
+            INP->>INP: 【0级】解析式填充 (<5ms)
+        else 纹理/结构复杂 且 quality=hq
+            INP->>INP: 【2级】PowerPaint V2 (124ms/块)
+        else 有GPU
+            INP->>INP: 【1级】LaMa batch (45ms/块, fp16)
+        else 无GPU
+            INP->>INP: 【3级】OpenCV Telea (2~8ms)
+        end
+        INP-->>P: erased_image
+        deactivate INP
+
+        Note over P,R: ---- 5. 样式分析与回填 ----
+        P->>P: analyze_style() 前景色/描边色宽/背景/对齐/字号/字重/行高
+        P->>R: render(erased_image, blocks, styles)
+        activate R
+        loop 每个 block
+            R->>R: fit_text() P1扩框→P2增行→P3缩字号→P4压缩→P5截断→P6原文
+            R->>R: font_registry.get(lang, size*scale, weight)
+            R->>R: 超采样 2~3x 绘制 → LANCZOS 下采样
+        end
+        R-->>P: rendered_image
+        deactivate R
+
+        P->>P: encode() JPEG q95 subsampling=0 / PNG / WebP
+        P-->>API: PipelineResult {image, blocks, stats, timing_ms, warnings}
+        deactivate P
+        deactivate Q
+
+        API->>Cache: set(key, result, ttl=24h)
+        deactivate Cache
+        API-->>PHP: 200 {code:0, image, blocks, timing_ms}
+    end
+    deactivate API
+
+    Note over PHP,API: ========== 异步分支（预估>15s 或 批量） ==========
+    PHP->>API: POST /v1/image/translate/async
+    API-->>PHP: 202 {code:0, task_id}
+    loop 轮询（建议 1s 间隔，指数退避至 5s）
+        PHP->>API: GET /v1/tasks/{task_id}
+        API-->>PHP: {status:"pending|running|done|failed", progress}
+    end
+    API-->>PHP: GET /tasks/{id} → {status:"done", data:{...}}

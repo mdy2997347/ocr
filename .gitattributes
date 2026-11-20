@@ -1,0 +1,17 @@
+# 换行符策略。
+#
+# 默认交给 git 判断哪些是文本，但**必须在 Linux 上执行的脚本要强制 LF**：
+# CRLF 会让 shebang 变成 "#!/usr/bin/env bash\r"，报
+# `/usr/bin/env: 'bash\r': No such file or directory`；
+# systemd 读 unit 文件时也会把 "\r" 带进 ExecStart，表现为服务起不来但日志
+# 只有一句 "Failed to locate executable"。
+#
+# 本仓库在 Windows 上开发、在 Ubuntu 上部署，本机 autocrlf=true 只能保护
+# 当前这台机器，.gitattributes 才能保护所有 clone。
+*.sh      text eol=lf
+*.service text eol=lf
+*.conf    text eol=lf
+
+# 图片按二进制处理，不做任何换行转换
+*.png binary
+*.jpg binary

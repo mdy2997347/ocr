@@ -1,0 +1,153 @@
+#!/usr/bin/env python
+"""启动 HTTP 服务。
+
+用法::
+
+    # 最小启动：自动读取项目根目录的 .env（API Key / 代理 / 端口）
+    python scripts/serve.py
+
+    # 覆盖 .env 里的值
+    python scripts/serve.py --port 8000 --proxy http://127.0.0.1:10809
+
+    # 指定代理 + 鉴权
+    python scripts/serve.py --port 8000 --proxy http://127.0.0.1:10809 --api-key my-secret
+
+    # 多 worker（注意：每个进程都会各自加载一份 OCR 模型，显存/内存要算够）
+    python scripts/serve.py --port 8000 --workers 2
+
+设计说明：
+
+* **模型在启动时预热**。OCR 首次加载要 6~8 秒（CPU），放在第一个请求里
+  会直接把 P95 顶穿。``--no-warmup`` 可以关掉，用于快速验证接口是否通。
+* 启动时先加载项目根目录的 ``.env``（见 :mod:`imgtrans.env`），再读命令行。
+  优先级：**命令行 > 环境变量 > .env**，线上临时改值不用动文件。
+* ``--api-key`` 不传时读环境变量 ``IMGTRANS_API_KEY``；两者都没有时
+  **拒绝启动**，除非显式 ``--dev``。避免默认裸奔上线。
+* 单 worker 就够：OCR 推理本身是 CPU/GPU 密集，多 worker 只会抢同一块卡。
+  真要提吞吐，靠多实例 + 前置负载均衡。
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from imgtrans.env import apply_model_dir, load_env  # noqa: E402 - 必须在 sys.path 修正之后
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    # 先加载 .env，再建 parser：argparse 的 default 是构建时求值的，
+    # 顺序反了就拿不到 .env 里的值（这是很容易踩的一脚）。
+    load_env()
+    # 模型缓存目录也在这里落地：paddlex 在 import 时就定死路径，晚于此无效
+    apply_model_dir()
+
+    parser = argparse.ArgumentParser(description="imgtrans HTTP 服务")
+    parser.add_argument(
+        "--host", default=os.environ.get("IMGTRANS_HOST", "127.0.0.1"), help="监听地址"
+    )
+    parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("IMGTRANS_PORT", "8000")), help="监听端口"
+    )
+    parser.add_argument(
+        "--proxy",
+        default=os.environ.get("IMGTRANS_PROXY") or None,
+        help="访问 Google / 图片下载用的代理（默认取 IMGTRANS_PROXY）",
+    )
+    parser.add_argument("--api-key", default=None, help="X-Api-Key 校验值（默认取 IMGTRANS_API_KEY）")
+    parser.add_argument(
+        "--device",
+        default=os.environ.get("IMGTRANS_DEVICE") or "cpu",
+        help="推理设备：cpu（默认）/ gpu / gpu:0 / auto（有卡就用卡，无卡回落 cpu）",
+    )
+    parser.add_argument("--dev", action="store_true", help="开发模式：不校验 API Key")
+    parser.add_argument("--workers", type=int, default=1, help="worker 进程数（每个都会加载一份模型）")
+    parser.add_argument("--no-warmup", action="store_true", help="跳过模型预热")
+    parser.add_argument("--output-format", default="png", choices=["png", "jpeg", "webp"])
+    args = parser.parse_args()
+
+    if args.dev:
+        os.environ["IMGTRANS_DEV"] = "1"
+    elif args.api_key:
+        os.environ["IMGTRANS_API_KEY"] = args.api_key
+    elif not os.environ.get("IMGTRANS_API_KEY"):
+        print(
+            "拒绝启动：没有配置 API Key。\n"
+            "  生产：--api-key <secret> 或环境变量 IMGTRANS_API_KEY\n"
+            "  开发：--dev（不校验）",
+            file=sys.stderr,
+        )
+        return 2
+
+    from imgtrans.device import DeviceError, resolve_device
+
+    # 设备在这里就解析并校验完，别等到 warmup：配了 gpu 但机器上是 CPU 版
+    # paddle 时，应该在打印"监听中"之前就退出，而不是先起服务再炸。
+    # 这一步只读配置、不加载模型（cpu 分支不会 import paddle），
+    # 所以放在 fastapi/uvicorn 之前——配错时能立刻退出，不用等框架导入。
+    try:
+        device = resolve_device(args.device)
+    except DeviceError as exc:
+        print(f"拒绝启动：{exc}", file=sys.stderr)
+        return 2
+
+    import uvicorn
+
+    from imgtrans.api.app import create_app
+    from imgtrans.pipeline import ImageTranslatePipeline, PipelineConfig
+    from imgtrans.translator import get_translator
+
+    logging.info("推理设备 %s（配置值：%s）", device, args.device)
+
+    # 设备确认之后才报监听地址：日志顺序就是启动顺序，
+    # 先喊"监听中"再因为设备配错退出，会让人以为服务起过又挂了。
+    logging.info(
+        "监听 %s:%s，代理 %s，鉴权 %s",
+        args.host,
+        args.port,
+        args.proxy or "无",
+        "关闭（--dev）" if args.dev else "开启",
+    )
+
+    def factory():
+        translator = get_translator("web", proxy=args.proxy, timeout=20)
+        pipeline = ImageTranslatePipeline(
+            translator,
+            config=PipelineConfig(output_format=args.output_format, device=device),
+        )
+        # 预热交给 app 的 startup 钩子统一做：两处都调的话 --no-warmup
+        # 只跳过了这里那次，startup 里还会照热一遍（真踩过）。
+        # proxy 显式传下去：/v1/translate/img 传 URL 时要用它下载图片
+        return create_app(pipeline, proxy=args.proxy, warmup=not args.no_warmup)
+
+    uvicorn.run(
+        factory(),
+        host=args.host,
+        port=args.port,
+        # 传的是 app 实例（pipeline 需要在这里装配），uvicorn 不允许
+        # 实例 + 多 worker 组合，所以这里始终单进程。
+        # 要提高吞吐请起多个实例，前面挂负载均衡——OCR 本身就是独占算力的。
+        workers=1,
+        log_level="info",
+    )
+    if args.workers > 1:
+        print(
+            f"提示：已忽略 --workers {args.workers}。每个进程都会加载一份 OCR 模型，"
+            "多进程只会抢同一块 CPU/GPU；请改为起多个实例。",
+            file=sys.stderr,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

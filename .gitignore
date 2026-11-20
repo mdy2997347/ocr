@@ -1,0 +1,42 @@
+# 真实密钥只留在本机（含 IMGTRANS_API_KEY）
+.env
+# 运行产物
+out/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# 测试与覆盖率产物
+.coverage
+htmlcov/
+coverage.xml
+
+# 构建产物
+dist/
+build/
+*.egg-info/
+
+# WorkBuddy 的工作记录（记忆、会话产物）。属于本机工具数据，
+# 每次对话都会改写，提交进来只会制造无意义的 diff。
+.workbuddy/
+
+# 编辑器与系统垃圾
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+
+# ---- uv 隔离部署 ----
+# 虚拟环境：每台机器各自 uv sync 生成，绝不入版本库
+.venv/
+.venv-*/
+# 本地工具链（uv.exe 等）与下载缓存，几百 MB
+.tools/
+# 模型缓存（约 240MB）。要离线部署可自行拷贝，但不该进 git
+.models/
+# 离线 wheel 包（paddlepaddle 单个就 100MB+）
+.wheels/
+
+# 注意：uv.lock **必须提交**。它记录 98 个传递依赖的精确版本与 hash，
+# 是 `uv sync --frozen` 能复现环境的唯一依据。忽略它就等于放弃可复现性。
