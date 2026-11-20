@@ -40,7 +40,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
 
 # 2. 建独立环境：CPU 或 GPU 二选一，必须显式指定
 uv sync --extra cpu
-# uv sync --extra gpu      # 需要 NVIDIA 驱动 + cu126
+# uv sync --extra gpu      # 需要 NVIDIA 驱动 >= 570（cu129 源，含 Blackwell sm_120）
 
 # 3. 配置（Windows 上把 cp 换成 copy）
 cp .env.example .env
@@ -208,6 +208,8 @@ sudo bash deploy/install.sh --dry-run    # 先看会做什么
 sudo bash deploy/install.sh              # 默认 /opt/imgtrans，端口 8000，CPU
 sudo bash deploy/install.sh --gpu --user ocr
 ```
+
+`--gpu` 会在下载任何东西之前先查驱动版本与磁盘空间（cu129 要求驱动 ≥ 570，磁盘 ≥ 10GB）。**别把源改回 cu126**：cu126 的 wheel 只编译到 sm_90，在 RTX 50 系列（Blackwell，sm_120）上能装、`is_compiled_with_cuda()` 返回 True，但一推理就 `no kernel image is available for execution on the device`。
 
 脚本里每一条都对应一个真实踩过的坑：必须装 `libgomp1`（否则 `import paddle` 直接失败）、必须装三个字体包（缺了**不报错**，只是把译文画成一排方块并返回 200）、不能用 Alpine（paddle 只发 glibc wheel）、不能用系统 `python3`（22.04 自带 3.10，低于 `requires-python`）。
 

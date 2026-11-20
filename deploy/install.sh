@@ -6,7 +6,7 @@
 #   sudo bash deploy/install.sh --dry-run          # 只打印将执行的动作，不动系统
 #   sudo bash deploy/install.sh                    # 默认 /opt/imgtrans，端口 8000，CPU
 #   sudo bash deploy/install.sh --dir /srv/imgtrans --port 8100
-#   sudo bash deploy/install.sh --user ocr --gpu   # GPU 机器（需已装 NVIDIA 驱动 + cu126）
+#   sudo bash deploy/install.sh --user ocr --gpu   # GPU 机器（需已装 NVIDIA 驱动 >= 570）
 #   sudo bash deploy/install.sh --no-nginx         # 只装服务，nginx 自己配
 #
 # 每条"为什么"都对应一个线上真实会踩的坑（详见 docs/linux-deploy.md）：
@@ -98,7 +98,8 @@ imgtrans Ubuntu 部署脚本
   --port <端口>    服务监听端口（默认 8000；若已存在 .env 则以 .env 里的为准）
   --user <用户>    运行服务的系统用户（默认 imgtrans，自动创建；
                    匹配 ^[a-z_][a-z0-9_-]*$，不能是 root）
-  --gpu            安装 GPU 版 paddle（--extra gpu，要求驱动 >= 550.54.14 / cu126）
+  --gpu            安装 GPU 版 paddle（--extra gpu，cu129 源，要求驱动 >= 570；
+                   RTX 50 系列/Blackwell 也能用，cu126 的 wheel 没有 sm_120 kernel）
   --no-nginx       不安装/不配置 nginx（自行反代时用；注意 client_max_body_size 与超时）
   --dry-run        只打印将执行的动作，不修改系统（无需 root）
   -h, --help       显示本帮助
@@ -235,6 +236,66 @@ derive_paths() {
 INSTALL_DIR="${INSTALL_DIR%/}"
 RUN_GROUP="${RUN_USER}"
 derive_paths
+
+# ===========================================================================
+# GPU 预检（--gpu 时在下载任何东西之前跑）
+# ===========================================================================
+#
+# 为什么必须提前查驱动：cu129 的 wheel 要求能跑 CUDA 12.9 的驱动（>= 570）。
+# 驱动不够时**安装不会失败** —— import 正常、is_compiled_with_cuda() 也返回
+# True，直到真正推理才抛 "no kernel image is available for execution on the
+# device"，而那句话和"我把 GPU 配错了"看起来毫无关系。等 2.9GB 下完再发现，
+# 成本是一轮 20 分钟的错误排查。
+readonly GPU_MIN_DRIVER_MAJOR=570
+
+check_gpu_preflight() {
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        die "--gpu 需要 NVIDIA 驱动，但没找到 nvidia-smi。
+  * 装驱动：ubuntu-drivers install（或从 NVIDIA 官网装 >= ${GPU_MIN_DRIVER_MAJOR} 的版本）
+  * 本来就没有卡 / 不打算用卡：去掉 --gpu，按 CPU 部署"
+    fi
+
+    local drv
+    drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null \
+        | head -n 1 | tr -d '[:space:]' || true)"
+    if [ -z "${drv}" ]; then
+        die "nvidia-smi 存在但读不到驱动版本。先单独跑一次 nvidia-smi 看它自己的报错
+  （最常见：内核升级后没重启，驱动模块没加载）。"
+    fi
+
+    local major="${drv%%.*}"
+    case "${major}" in
+        ''|*[!0-9]*)
+            warn "驱动版本无法解析（${drv}），跳过版本检查" ;;
+        *)
+            if [ "${major}" -lt "${GPU_MIN_DRIVER_MAJOR}" ]; then
+                die "驱动 ${drv} 低于 cu129 要求的 ${GPU_MIN_DRIVER_MAJOR}+。
+  装完不会报错，但第一次推理会抛 "no kernel image is available for execution
+  on the device" —— 这个报错和驱动版本看起来毫无关系，极难联想到一起。
+  处理：升级 NVIDIA 驱动后重跑本脚本；或去掉 --gpu 用 CPU 部署。"
+            fi
+            log "NVIDIA 驱动 ${drv}（>= ${GPU_MIN_DRIVER_MAJOR}，满足 cu129）"
+            ;;
+    esac
+
+    # 记录型号就够了：源已固定 cu129，sm_100/sm_120（Blackwell）的 kernel 在里面。
+    # 这里不做拦截判断，只让日志能回答"这台机器到底是什么卡"。
+    local gpu_name
+    gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null \
+        | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+    [ -n "${gpu_name}" ] && log "GPU：${gpu_name}"
+
+    # 磁盘：GPU 版 wheel 2.9GB + 解压出的 site-packages + uv 缓存（在安装目录内，
+    # 见 derive_paths 的 UV_CACHE）。实测 CPU 版约 2GB、GPU 版 10GB 起跳。
+    # 不查的话，uv sync 会在下载到一半时 "No space left on device"，
+    # 而报错指向的是 uv 的临时目录，看不出是磁盘不够。
+    local need_mb=10240 avail_mb
+    avail_mb="$(df -Pm "$(dirname "${INSTALL_DIR}")" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
+    if [ "${avail_mb:-0}" -gt 0 ] && [ "${avail_mb}" -lt "${need_mb}" ]; then
+        warn "目标分区可用 ${avail_mb}MB，GPU 版建议 >= ${need_mb}MB（wheel 2.9GB + 解压 + uv 缓存）。
+  空间不足最可能的表现是下载中途失败，而不是一开始就报错。"
+    fi
+}
 
 # ===========================================================================
 # 步骤 1：前置条件
@@ -394,6 +455,12 @@ step_preflight() {
     mem_mb="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
     if [ "${mem_mb}" -gt 0 ] && [ "${mem_mb}" -lt 1900 ]; then
         warn "内存仅 ${mem_mb}MB。OCR 常驻约 500MB~1GB，建议 >=2GB（推荐 4GB），否则易 OOM。"
+    fi
+
+    # --gpu 的驱动/磁盘检查放在这里：必须在 step_files（拷文件）与 step_sync
+    # （下 2.9GB）之前，否则就失去"提前发现"的意义。
+    if [ "${ENABLE_GPU}" -eq 1 ]; then
+        check_gpu_preflight
     fi
 
     ok "前置条件全部满足"
@@ -743,18 +810,36 @@ step_sync() {
     fi
 
     if [ "${ENABLE_GPU}" -eq 1 ]; then
-        # 装错版本时服务会启动即退出并说明原因（不会悄悄回落 CPU），这里先探一次更直观
+        # is_compiled_with_cuda() 只证明这个 wheel 带 CUDA 编译，不证明当前驱动
+        # 能执行 kernel —— RTX 50 系列（sm_120）配 cu126 的 wheel 就典型地过得
+        # 了这一项、推理时才炸 "no kernel image is available"。所以这里查运行时
+        # 真判据 device_count()，顺便把计算能力打出来备查。
         if [ "${DRY_RUN}" -eq 0 ]; then
-            local cuda_ok
-            cuda_ok="$(runuser -u "${RUN_USER}" -- "${INSTALL_DIR}/.venv/bin/python" -c \
-                'import paddle; print(paddle.device.is_compiled_with_cuda())' 2>&1 || true)"
-            case "${cuda_ok}" in
-                *True*) log "GPU 版 paddle 校验通过（is_compiled_with_cuda=True）" ;;
-                *)
-                    warn "GPU 版 paddle 自检未通过：${cuda_ok}"
-                    warn "常见原因：驱动版本低于 550.54.14、或装成了 CPU 版。可改 .env 的 IMGTRANS_DEVICE=cpu 先上线。"
-                    ;;
-            esac
+            local gpu_probe count cap
+            gpu_probe="$(runuser -u "${RUN_USER}" -- "${INSTALL_DIR}/.venv/bin/python" -c '
+import paddle
+print("cuda_compiled=%s" % paddle.device.is_compiled_with_cuda())
+print("device_count=%s" % paddle.device.cuda.device_count())
+try:
+    major, minor = paddle.device.cuda.get_device_capability()
+    print("capability=%s.%s" % (major, minor))
+except Exception as exc:
+    print("capability=unknown(%s)" % exc)
+' 2>&1 || true)"
+            count="$(printf '%s\n' "${gpu_probe}" | sed -n 's/^device_count=//p' | tail -n 1)"
+            if [ "${count:-0}" -ge 1 ] 2>/dev/null; then
+                cap="$(printf '%s\n' "${gpu_probe}" | sed -n 's/^capability=//p' | tail -n 1)"
+                log "GPU 自检通过：${count} 个可用设备，计算能力 sm_${cap}"
+                case "${cap}" in
+                    12.*|10.*)
+                        log "识别到 Blackwell（sm_${cap}）：kernel 来自 pyproject 的 cu129 源，cu126 的 wheel 不含这一代" ;;
+                esac
+            else
+                warn "GPU 自检未通过（device_count=0）：paddle 能看到驱动，但看不到可用设备。"
+                printf '%s\n' "${gpu_probe}" | sed 's/^/    /' >&2
+                warn "常见原因：驱动刚升级没重启、容器没透传 GPU、MIG 配置、或装成了 CPU 版 paddle。"
+                warn "先降级上线：把 ${ENV_FILE} 的 IMGTRANS_DEVICE 改成 cpu，restart 后再排查。"
+            fi
         fi
     fi
 
@@ -882,6 +967,8 @@ IMGTRANS_HOST=127.0.0.1
 IMGTRANS_PORT=${EFFECTIVE_PORT}
 
 # 推理设备：cpu / gpu / gpu:0 / auto（有卡用卡、无卡回落 cpu）
+# 注意：GPU 版 wheel 走 cu129 源（含 Blackwell sm_100/sm_120 的 kernel）。
+# 换成 cu126 在 RTX 50 系列上会装得上、跑不动（no kernel image）。
 IMGTRANS_DEVICE=${device}
 
 # OCR 速度档位：quality（默认，最准）/ fast（CPU 上实测快一倍）
@@ -982,6 +1069,8 @@ step_doctor() {
   * “字体索引 一个字体都没找到” → apt install fonts-noto-cjk fonts-dejavu-core fonts-noto-core
   * “字体 zh 回退到 DejaVuSans → 会画成豆腐块” → 同上，装 fonts-noto-cjk
   * “推理设备 xxx 不可用”     → 配了 gpu 但装的是 CPU 版 paddle；改 .env 的 IMGTRANS_DEVICE=cpu 或装 GPU 版
+  * 推理报 “no kernel image is available” → 驱动或 wheel 的架构代对不上：
+                              RTX 50 系列（sm_120）要 cu129/cu130 的 wheel，cu126 没有它的 kernel
 EOF
         die "${CURRENT_STEP}未通过"
     fi
