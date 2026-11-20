@@ -884,6 +884,14 @@ IMGTRANS_OCR_PROFILE=quality
 # 且不会与同机其它 paddle 项目互相污染。
 IMGTRANS_MODEL_DIR=.models
 
+# 模型下载源：huggingface（paddlex 默认）/ bos / modelscope / aistudio。
+# 默认填 bos 的原因：huggingface 的元数据（config.json 等几 KB）通常能下，
+# 但几 MB 的 inference.pdiparams 在国内/香港机房经常超时，症状是"模型一直
+# 没下完"——更麻烦的是代码会**静默回退到慢档**，不看日志发现不了。
+# 注意 paddlex 会先做连通性探测，探测不过就跳过该源（不报错），
+# 所以这项只是"优先"，不通时仍会退回 huggingface。
+PADDLE_PDX_MODEL_SOURCE=bos
+
 # 额外字体目录，可选。字体装到系统目录时不用设。
 # IMGTRANS_FONT_DIRS=/opt/fonts
 EOF

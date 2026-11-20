@@ -67,8 +67,17 @@ uv run python scripts/serve.py --port 8000
 | `IMGTRANS_PROXY` | 空 | 访问 Google / 下载图片用的代理，服务器能直连则留空 |
 | `IMGTRANS_HOST` / `IMGTRANS_PORT` | `127.0.0.1` / `8000` | 监听地址 |
 | `IMGTRANS_DEVICE` | `cpu` | `cpu` / `gpu` / `gpu:0` / `auto`（有卡用卡，无卡回落） |
+| `IMGTRANS_TRANSLATOR` | `web` | `web`（免费通道，机房 IP 易被 429）/ `cloud`（官方 v2，需 Key） |
+| `IMGTRANS_OCR_PROFILE` | `quality` | `quality` / `fast`（只换检测模型，CPU 上快一倍，见下） |
+| `IMGTRANS_OCR_DET_SIDE_LEN` | 空 | 检测长边上限，默认 736；调小约再快 15%，密集小字会漏 |
 | `IMGTRANS_FONT_DIRS` | 空 | 额外字体目录，多个用 `;` 或 `:` 分隔 |
 | `IMGTRANS_MODEL_DIR` | `.models` | 模型缓存位置，相对路径以项目根为基准 |
+| `PADDLE_PDX_MODEL_SOURCE` | `bos`（安装脚本写入） | 模型下载源：`bos` / `huggingface` / `modelscope` / `aistudio` |
+
+`fast` 档的检测模型是**额外下载**的。国内/香港机房从 HuggingFace 拉几 MB 的
+`inference.pdiparams` 常超时，此时程序会**静默回退 `quality`**、接口照常 200，
+只是永远不提速。所以安装脚本默认写入 `PADDLE_PDX_MODEL_SOURCE=bos`；排查时
+看 `/healthz` 有没有 `ocr_fallback: true`，或日志里 `Creating model` 的模型名。
 
 `.env` 里有真实密钥，已被 `.gitignore` 排除。仓库里只有 `.env.example`。
 
