@@ -64,7 +64,18 @@ def main() -> int:
         default=os.environ.get("IMGTRANS_PROXY") or None,
         help="访问 Google / 图片下载用的代理（默认取 IMGTRANS_PROXY）",
     )
-    parser.add_argument("--api-key", default=None, help="X-Api-Key 校验值（默认取 IMGTRANS_API_KEY）")
+    parser.add_argument(
+        "--api-key", default=None, help="X-Api-Key 校验值（默认取 IMGTRANS_API_KEY）"
+    )
+    parser.add_argument(
+        "--translator",
+        default=os.environ.get("IMGTRANS_TRANSLATOR") or "web",
+        help=(
+            "翻译通道（默认取 IMGTRANS_TRANSLATOR）："
+            "web/api/free=免费 web 接口（机房 IP 会被 429 限流）；"
+            "cloud/nmt=官方 Cloud Translation v2（需 API Key，稳定）"
+        ),
+    )
     parser.add_argument(
         "--device",
         default=os.environ.get("IMGTRANS_DEVICE") or "cpu",
@@ -105,22 +116,50 @@ def main() -> int:
 
     from imgtrans.api.app import create_app
     from imgtrans.pipeline import ImageTranslatePipeline, PipelineConfig
-    from imgtrans.translator import get_translator
+    from imgtrans.translator import build_translator
 
     logging.info("推理设备 %s（配置值：%s）", device, args.device)
+
+    # 翻译通道在这里就建出来，而不是等 factory()：
+    #   * 通道名写错（比如 IMGTRANS_TRANSLATOR=googel）要在加载模型之前退出；
+    #   * 启动日志能如实打出"到底走哪条通道"——线上排查 429 时，
+    #     第一个要看的就是这句，而不是翻代码猜默认值。
+    google_key = os.environ.get("IMGTRANS_GOOGLE_KEY")
+    google_credentials = os.environ.get("IMGTRANS_GOOGLE_CREDENTIALS")
+    google_project = os.environ.get("IMGTRANS_GOOGLE_PROJECT")
+    try:
+        translator = build_translator(
+            args.translator,
+            proxy=args.proxy,
+            timeout=20,
+            google_key=google_key,
+            google_credentials=google_credentials,
+            google_project=google_project,
+        )
+    except ValueError as exc:
+        print(f"拒绝启动：{exc}", file=sys.stderr)
+        return 2
+
+    if getattr(translator, "kind", "") == "cloud" and not (
+        google_key or google_credentials
+    ):
+        logging.warning(
+            "cloud 通道未配置 IMGTRANS_GOOGLE_KEY / IMGTRANS_GOOGLE_CREDENTIALS，"
+            "将回落到 Google 的 ADC 默认凭证（要求机器上已 gcloud auth）"
+        )
 
     # 设备确认之后才报监听地址：日志顺序就是启动顺序，
     # 先喊"监听中"再因为设备配错退出，会让人以为服务起过又挂了。
     logging.info(
-        "监听 %s:%s，代理 %s，鉴权 %s",
+        "监听 %s:%s，翻译通道 %s，代理 %s，鉴权 %s",
         args.host,
         args.port,
+        getattr(translator, "kind", args.translator),
         args.proxy or "无",
         "关闭（--dev）" if args.dev else "开启",
     )
 
     def factory():
-        translator = get_translator("web", proxy=args.proxy, timeout=20)
         pipeline = ImageTranslatePipeline(
             translator,
             config=PipelineConfig(output_format=args.output_format, device=device),

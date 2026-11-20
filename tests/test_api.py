@@ -369,5 +369,70 @@ class ApiContractTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 422)
 
 
+@unittest.skipUnless(HAS_DEPS and HAS_FASTAPI, "需要 opencv/pillow/fastapi")
+class HealthzContractTest(unittest.TestCase):
+    """``/healthz`` 必须把翻译通道状态吐出来。
+
+    背景（2026-11 线上）：Google 免费通道对机房 IP 返回 429，熔断打开后
+    所有翻译请求直接返回原文，接口照样 ``200 OK`` + 一张原封不动的中文图。
+    运维当时只能翻 journalctl 猜，因为探活接口只报 ``{"ok": true}``。
+    所以这里锁死三件事：通道名、熔断是否打开、最近一次失败原因。
+    """
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {"IMGTRANS_DEV": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("IMGTRANS_API_KEY", None)
+
+    def _healthz(self, translator) -> dict:
+        from imgtrans.api.app import create_app
+        from imgtrans.pipeline import ImageTranslatePipeline
+
+        pipeline = ImageTranslatePipeline(translator, ocr=FakeOcr())
+        client = TestClient(create_app(pipeline))
+        resp = client.get("/healthz")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return resp.json()
+
+    def test_reports_channel_and_breaker_state(self) -> None:
+        class HealthyTranslator(FakeTranslator):
+            kind = "web"
+            circuit_open = False
+            circuit_trip_count = 0
+            last_error = None
+
+        payload = self._healthz(HealthyTranslator({"登录": "Login"}))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["translator"], "web")
+        self.assertIs(payload["translator_breaker_open"], False)
+        self.assertEqual(payload["translator_trips"], 0)
+        self.assertNotIn("translator_last_error", payload)
+
+    def test_surfaces_open_breaker_and_reason(self) -> None:
+        class TrippedTranslator(FakeTranslator):
+            kind = "web"
+            circuit_open = True
+            circuit_trip_count = 3
+            last_error = "free/api 两个通道均失败，api 通道最后 HTTP 429"
+
+        payload = self._healthz(TrippedTranslator({"登录": "Login"}))
+        self.assertIs(payload["translator_breaker_open"], True)
+        self.assertEqual(payload["translator_trips"], 3)
+        self.assertIn("429", payload["translator_last_error"])
+
+    def test_translator_without_breaker_still_reports_kind(self) -> None:
+        """cloud 通道没有熔断器，不能因此让整个 healthz 崩掉。"""
+
+        class CloudTranslator(FakeTranslator):
+            kind = "cloud"
+            last_error = None
+
+        payload = self._healthz(CloudTranslator({"登录": "Login"}))
+        self.assertEqual(payload["translator"], "cloud")
+        self.assertNotIn("translator_breaker_open", payload)
+        self.assertNotIn("translator_trips", payload)
+
+
 if __name__ == "__main__":
     unittest.main()

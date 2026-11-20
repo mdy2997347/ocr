@@ -74,6 +74,12 @@ class GoogleCloudTranslator:
         self._model = model
         self._batch_size = int(batch_size)
         self._client = client
+        #: 通道标识，供 ``/healthz`` 与启动日志展示。
+        self.kind: str = "cloud"
+        #: 与 web 通道保持同一套"失败可见"约定：``None`` = 本轮没出故障。
+        #: cloud 通道失败会直接抛异常（有配额与错误码，不必静默降级），
+        #: 所以这个字段只在被上层统一读取时用到，始终为 ``None``。
+        self.last_error: str | None = None
 
     # ------------------------------------------------------------------ #
     # 公共 API

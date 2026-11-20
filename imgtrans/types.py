@@ -174,6 +174,20 @@ class OcrError(ImageTranslateError):
     code = "E_OCR"
 
 
+class TranslateError(ImageTranslateError):
+    """翻译通道整体失败（429 限流、熔断打开、凭证失效、通道全挂）。
+
+    与"没有需要翻译的文字"必须严格区分：
+
+    * 后者是正常结果——图里本来就没有可译文字，返回原图是对的；
+    * 前者是故障——此时返回原图，调用方拿到的是 ``200 OK`` 加一张**原封不动的
+      中文图**，会以为翻译成功了。线上排查一个这样的静默降级要翻半小时日志
+      （429 → 熔断 → 不再发请求 → 没有任何异常堆栈），所以这里宁可报错。
+    """
+
+    code = "E_TRANSLATE"
+
+
 class UnsupportedLangError(ImageTranslateError):
     """目标语言码不在支持清单内（见 ``SUPPORTED_LANGS``）。
 

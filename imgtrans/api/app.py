@@ -46,6 +46,7 @@ _ERROR_STATUS: dict[str, int] = {
     "E_LANG": 400,  # 目标语言码不受支持：属于调用方参数错误
     "E_PARAM": 400,  # 参数本身不合法（img 既不是 URL 也不是合法 base64 等）
     "E_OCR": 500,
+    "E_TRANSLATE": 502,  # 翻译通道不可用：上游故障，调用方可重试/切备用
     "E_INTERNAL": 500,
     "E_AUTH": 401,
     "E_PAYLOAD": 413,
@@ -249,6 +250,30 @@ def create_app(
         payload: dict[str, Any] = {"ok": True}
         if device:
             payload["device"] = device
+
+        # 翻译通道状态。2026-11 线上踩过：Google 免费接口对机房 IP 返回 429，
+        # 熔断器打开后所有请求直接返回原文，接口照样 200 + 原图，
+        # 表现是"图片还是中文"却没有任何报错。把熔断状态放进探活接口后，
+        # 运维 curl 一下就看得见，不必再翻日志猜。
+        translator = getattr(pipeline, "translator", None)
+        if translator is not None:
+            payload["translator"] = getattr(translator, "kind", type(translator).__name__)
+            # 属性名以翻译器实际暴露的为准（web 通道是 circuit_open /
+            # circuit_trip_count，cloud 通道没有熔断器）。写错名字不会报错，
+            # 只会让字段静默消失，所以这里两个都试，取到的那个就是真的。
+            breaker_open = getattr(
+                translator, "circuit_open", getattr(translator, "breaker_open", None)
+            )
+            if breaker_open is not None:
+                payload["translator_breaker_open"] = bool(breaker_open)
+            trips = getattr(
+                translator, "circuit_trip_count", getattr(translator, "trip_count", None)
+            )
+            if trips is not None:
+                payload["translator_trips"] = int(trips)
+            last_error = getattr(translator, "last_error", None)
+            if last_error:
+                payload["translator_last_error"] = last_error
         return payload
 
     @app.get("/v1/languages")

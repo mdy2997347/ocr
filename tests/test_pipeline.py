@@ -11,7 +11,7 @@ import unittest
 import numpy as np
 
 from imgtrans.pipeline import ImageTranslatePipeline, PipelineConfig, should_translate
-from imgtrans.types import Polygon, TextBlock
+from imgtrans.types import Polygon, TextBlock, TranslateError
 
 
 class ShouldTranslateTest(unittest.TestCase):
@@ -181,6 +181,56 @@ class TranslationIndexMappingTest(unittest.TestCase):
         blocks = [_block(0, "a", 0, 0)]
         pipeline = ImageTranslatePipeline(BoomTranslator(), ocr=FakeOcr(blocks))
         self.assertEqual(pipeline._translate_blocks(blocks, None, "zh-CN"), ["a"])
+
+
+class TranslateFailureSurfacingTest(unittest.TestCase):
+    """翻译通道整体失败时必须报错，不能 200 + 一张原封不动的原图。
+
+    线上真实事故：Google 对机房 IP 返回 429 → 熔断打开 → 之后所有请求
+    直接返回原文 → pipeline 判定"没有可回填的块" → 200 + 中文原图。
+    调用方以为成功，排查时日志里连异常都没有。
+    """
+
+    @staticmethod
+    def _png() -> bytes:
+        from PIL import Image
+        import io as _io
+
+        img = Image.new("RGB", (200, 120), (240, 240, 240))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_raises_when_channel_failed(self) -> None:
+        class FailingTranslator:
+            last_error = "熔断打开（连续 403/429 达阈值）"
+
+            def translate_batch(self, texts, source, target):  # noqa: ANN001, ANN201
+                return list(texts)
+
+        blocks = [_block(0, "床品四件套", 0, 0, w=180, h=30)]
+        pipeline = ImageTranslatePipeline(FailingTranslator(), ocr=FakeOcr(blocks))
+
+        with self.assertRaises(TranslateError) as ctx:
+            pipeline.translate_bytes(self._png(), "en")
+        self.assertEqual(ctx.exception.code, "E_TRANSLATE")
+
+    def test_returns_original_when_nothing_to_translate(self) -> None:
+        """没出故障、只是译文与原文相同（例如全是数字）→ 仍返回原图。"""
+
+        class EchoTranslator:
+            last_error = None
+
+            def translate_batch(self, texts, source, target):  # noqa: ANN001, ANN201
+                return list(texts)
+
+        blocks = [_block(0, "abc", 0, 0, w=180, h=30)]
+        pipeline = ImageTranslatePipeline(EchoTranslator(), ocr=FakeOcr(blocks))
+
+        result = pipeline.translate_bytes(self._png(), "en")
+
+        self.assertEqual(result.translated_count, 0)
+        self.assertTrue(any("返回原图" in w for w in result.warnings))
 
 
 class TargetLangGuardTest(unittest.TestCase):

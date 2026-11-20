@@ -45,6 +45,7 @@ from .types import (
     ImageTranslateError,
     PipelineResult,
     TextBlock,
+    TranslateError,
     UnsupportedLangError,
 )
 
@@ -154,6 +155,15 @@ class ImageTranslatePipeline:
     def device(self) -> str:
         """实际生效的推理设备（已归一化），用于启动日志与健康检查。"""
         return self._ocr.device
+
+    @property
+    def translator(self) -> BaseTranslator:
+        """翻译通道实例。
+
+        暴露出来是为了让 ``/healthz`` 能报告"通道是哪条、熔断有没有打开"——
+        熔断打开时翻译会静默返回原文，光看接口响应是看不出来的。
+        """
+        return self._translator
 
     def warmup(self) -> None:
         """预热：加载 OCR 模型，避免首图等待。
@@ -304,7 +314,15 @@ class ImageTranslatePipeline:
             if dst and dst.strip() and dst != block.text
         ]
 
+        # 翻译器的契约是"永不抛异常，失败保留原文"。这个契约保证了单块失败
+        # 不拖垮整张图，但也把"通道整个挂了"藏了起来：429 限流 → 熔断打开 →
+        # 之后连请求都不发，接口照样 200 返回一张原封不动的中文图。
+        # 所以这里读一次 last_error：有值且一块都没译出来，就是故障，必须报错。
+        failure = getattr(self._translator, "last_error", None)
+
         if not targets:
+            if failure:
+                raise TranslateError(f"翻译通道不可用，未产生任何译文：{failure}")
             warnings.append("所有块译文与原文一致或无有效译文，返回原图")
             out_bytes, out_mime = _encode_image(
                 image_bgr, self._config.output_format, self._config.output_quality, icc
@@ -317,6 +335,10 @@ class ImageTranslatePipeline:
                 timings=timings,
                 warnings=warnings,
             )
+
+        if failure:
+            # 部分批次失败但还能出图：不阻断，但要让调用方知道哪张图不完整
+            warnings.append(f"部分文本翻译失败，该部分保留原文：{failure}")
 
         selected = [blocks[i] for i in targets]
         selected_translations = [translations[i] for i in targets]
