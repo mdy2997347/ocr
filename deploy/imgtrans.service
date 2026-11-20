@@ -26,10 +26,23 @@ Group=@RUN_GROUP@
 
 WorkingDirectory=@INSTALL_DIR@
 
-# HOME 指到安装目录：uv / paddle / matplotlib 之类都会往 $HOME 写缓存，
+# HOME 指到 .tools/home：uv / paddle / matplotlib 之类都会往 $HOME 写缓存，
 # 而运行用户是 --no-create-home 建的（没有 /home/xxx），$HOME 若是 /nonexistent
 # 会得到一堆"只读文件系统/权限不足"的迷惑告警。
-Environment=HOME=@INSTALL_DIR@
+#
+# 为什么不是安装目录本身：安装目录顶层是 root:组 + go-w（代码只读），
+# 服务往里写 $HOME/.cache 会被拒绝。.tools 整棵树的属主才是运行用户。
+Environment=HOME=@INSTALL_DIR@/.tools/home
+
+# 清空 LD_LIBRARY_PATH：必须，不是洁癖。
+# 宿主机上若装过 CUDA toolkit，shell 配置里常有一句
+#   export LD_LIBRARY_PATH=/usr/local/cuda/lib64
+# 该目录下的 compat/libcuda.so.1 是 forward-compat 垫片，会排在宿主驱动
+# （/usr/lib/x86_64-linux-gnu/libcuda.so.590.xx）前面，于是 CUDA 初始化报
+#   CUDA error(803) CUDA_ERROR_SYSTEM_DRIVER_MISMATCH
+# 典型症状：nvidia-smi 正常、别的 GPU 程序也正常，唯独本服务 device_count=0。
+# 写成空串是 systemd 的标准做法：getenv 有值但为空，动态链接器直接跳过。
+Environment="LD_LIBRARY_PATH="
 # 日志不缓冲：否则 journalctl 里要等缓冲区满才看到内容，排障时像卡死
 Environment=PYTHONUNBUFFERED=1
 # 不设 PADDLE_PDX_CACHE_HOME：模型目录由 .env 的 IMGTRANS_MODEL_DIR 决定，

@@ -141,9 +141,25 @@ run_sh() {
 # 精简镜像里常常没有 sudo，而 util-linux 一定存在。
 as_user() {
     # PATH 显式给定：runuser 继承的 PATH 里不一定有 /usr/local/bin（uv 装在那儿）
-    run runuser -u "${RUN_USER}" -- env \
-        "HOME=${INSTALL_DIR}" \
+    #
+    # HOME 不能用 INSTALL_DIR：uv 拿 HOME 去推 $HOME/.local/bin 放 python 可执行链接，
+    # 而安装目录顶层是 root:组 + go-w，imgtrans 建不了子目录，于是
+    #   warning: Failed to create directory `/www/.../.local/bin`: Permission denied
+    # 只是 warning 但每次 sync 都刷一遍，且哪个 uv 版本改成硬错误就是一次线上失败。
+    # 指到 .tools/home（属主是运行用户）后，uv 所有落到 HOME 的东西都在可写区内，
+    # 也不会往项目根目录里丢 .local/。
+    #
+    # -u LD_LIBRARY_PATH 是硬要求，不是洁癖：runuser 不清环境，root shell 里一句
+    # export LD_LIBRARY_PATH=/usr/local/cuda/lib64 就会带进来，而那个目录下的
+    # compat/libcuda.so.1 是 forward-compat 垫片，排在宿主驱动前面就会报
+    #   CUDA error(803) CUDA_ERROR_SYSTEM_DRIVER_MISMATCH
+    # 表现是 nvidia-smi 正常、llama-server 也正常，唯独 paddle 的 device_count=0。
+    # 实测：清掉后 device_count 从 0 变 1，加载回 /usr/lib/x86_64-linux-gnu/libcuda.so.590.48.01。
+    # venv 里所有库都是 pip 装的（自带 rpath），不依赖系统的 LD_LIBRARY_PATH。
+    run runuser -u "${RUN_USER}" -- env -u LD_LIBRARY_PATH \
+        "HOME=${UV_HOME}" \
         "UV_CACHE_DIR=${UV_CACHE}" \
+        "UV_PYTHON_BIN_DIR=${UV_BIN_DIR}" \
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         ${UV_PYTHON_DIR:+"UV_PYTHON_INSTALL_DIR=${UV_PYTHON_DIR}"} \
         "$@"
@@ -230,12 +246,26 @@ derive_paths() {
     KEY_FILE="${INSTALL_DIR}/.env.key"
     UV_CACHE="${INSTALL_DIR}/.tools/uvcache"
     UV_PYTHON_DIR="${INSTALL_DIR}/.tools/python"
+    # 降权执行时的 HOME。必须是运行用户可写、且不在 /home 或 /root 下
+    # （systemd 的 ProtectHome=yes 会让服务看不见那两个目录）。
+    UV_HOME="${INSTALL_DIR}/.tools/home"
+    # uv 把 python3.x 可执行链接放这里，默认是 $HOME/.local/bin
+    UV_BIN_DIR="${INSTALL_DIR}/.tools/bin"
 }
 
 # 去掉结尾斜杠，避免拼出 //opt/imgtrans 这种路径
 INSTALL_DIR="${INSTALL_DIR%/}"
 RUN_GROUP="${RUN_USER}"
 derive_paths
+
+# uv 的唯一权威位置。
+#
+# 为什么写死绝对路径而不是用 `uv`：降权执行走的 PATH 是固定白名单
+# （见 as_user），只含 /usr/local/bin 等系统目录。一旦 uv 装在
+# /root/.local/bin 之类的地方，root 交互 shell 能 `command -v uv` 找到、
+# 而 imgtrans 用户执行时就是 "env: 'uv': No such file or directory"（退出码 127）。
+# 把位置收敛成一个变量，检查与执行才是同一个判据。
+UV_BIN="${UV_BIN:-/usr/local/bin/uv}"
 
 # ===========================================================================
 # GPU 预检（--gpu 时在下载任何东西之前跑）
@@ -295,6 +325,46 @@ check_gpu_preflight() {
         warn "目标分区可用 ${avail_mb}MB，GPU 版建议 >= ${need_mb}MB（wheel 2.9GB + 解压 + uv 缓存）。
   空间不足最可能的表现是下载中途失败，而不是一开始就报错。"
     fi
+
+    # LD_LIBRARY_PATH 里带 CUDA 路径是 GPU 部署最常见的"隐形地雷"：
+    # apt 装的 CUDA toolkit 会在 /usr/local/cuda*/compat 放一份 forward-compat
+    # 的 libcuda.so.1，它排在宿主驱动前面时 CUDA 初始化直接报
+    #   CUDA error(803) CUDA_ERROR_SYSTEM_DRIVER_MISMATCH
+    # 症状极具迷惑性：nvidia-smi 正常、llama-server 之类也正常，
+    # 唯独 paddle 的 device_count=0，看起来像"paddle 坏了"。
+    # 这里只提示不自动改：这个变量可能被同机其它 GPU 服务依赖，动错影响面更大。
+    # 本脚本的 as_user 与生成的 systemd 单元都已显式清空它。
+    case "${LD_LIBRARY_PATH:-}" in
+        *cuda*|*CUDA*)
+            warn "当前 shell 的 LD_LIBRARY_PATH 含有 CUDA 路径：${LD_LIBRARY_PATH}"
+            warn "  它可能让 paddle 加载 compat 版 libcuda，表现为 device_count=0 / CUDA error(803)。"
+            warn "  本脚本与服务单元已显式清空该变量；但你手动跑 python 调试时仍会踩到。"
+            warn "  定位并删掉那一行：grep -rn 'LD_LIBRARY_PATH' /etc/profile.d/ ~/.bashrc /etc/environment"
+            ;;
+    esac
+}
+
+# 找出是谁把 LD_LIBRARY_PATH 注进了子进程环境。
+#
+# 为什么值得单独写一个函数：803 那轮排查里，父 shell 里 `echo $LD_LIBRARY_PATH`
+# 是空的，子进程却带着 CUDA 路径 —— 变量是 runuser 走 PAM 时由 /etc/environment
+# 注入的。只 grep ~/.bashrc 永远找不到，于是"看起来没有污染，但就是 803"。
+# 所以这里把所有可能的位置一次列全，直接给出 file:line 让用户去删。
+ld_library_path_sources() {
+    local files=() f
+    for f in /etc/environment /etc/security/pam_env.conf /etc/profile /etc/bash.bashrc; do
+        [ -f "${f}" ] && files+=("${f}")
+    done
+    for f in /etc/profile.d/*.sh; do
+        [ -f "${f}" ] && files+=("${f}")
+    done
+    if [ "${#files[@]}" -eq 0 ]; then
+        return 0
+    fi
+    # 过滤掉注释行：注释掉的 export 不生效，列出来只会增加噪音
+    grep -Hn 'LD_LIBRARY_PATH' "${files[@]}" 2>/dev/null \
+        | grep -v ':[0-9]*:[[:space:]]*#' \
+        || true
 }
 
 # ===========================================================================
@@ -488,15 +558,83 @@ step_apt() {
     # DEBIAN_FRONTEND：避免任何 debconf 交互；非交互环境下必加
     # DPkg::Lock::Timeout：Ubuntu 默认开 unattended-upgrades，撞锁时等一会儿就好，
     #   不设的话一次可自愈的竞争会被放大成"安装失败"。
-    run env DEBIAN_FRONTEND=noninteractive \
-        apt-get -o DPkg::Lock::Timeout=120 update -y
+    #
+    # 为什么 update 失败要降级而不是 die：这机器上只要装过 CUDA / cuDNN /
+    # Docker / 宝塔，就一定带第三方源；其中任何一个被移除或过期，update 都会
+    # 返回 100，典型报错是
+    #   "The repository 'file:/var/cudnn-local-repo-ubuntu2204-8.9.7.29 Release'
+    #    no longer has a Release file"
+    # 而要装的 libgomp1 与三个字体包全在 Ubuntu 官方源里 —— 一个与本次安装
+    # 无关的坏源不该让整台机器的部署中断。真正的判据交给 apt-get install：
+    # 真缺包时它会明确报 "Unable to locate package xxx"，比"某个源坏了"精确。
+    if ! run env DEBIAN_FRONTEND=noninteractive \
+        apt-get -o DPkg::Lock::Timeout=120 update -y; then
+        warn "apt-get update 报错（退出码非 0），已忽略并继续安装。"
+        # 把可疑的本地源点出来。不点的话用户得从几十行输出里自己找那一行 E:，
+        # 而"file:/var/cudnn-local-repo-..."这句话本身不说明该怎么修。
+        local broken_src
+        broken_src="$(grep -rlE 'cudnn-local|cuda-local|/var/cudnn|/var/cuda' \
+            /etc/apt/sources.list.d/ 2>/dev/null || true)"
+        if [ -n "${broken_src}" ]; then
+            warn "以下是可能失效的本地源（多为 CUDA/cuDNN 安装包的残留配置）："
+            printf '%s\n' "${broken_src}" | sed 's/^/    /' >&2
+            warn "它们指向的 .deb 被清掉后会一直报 'no longer has a Release file'。"
+            warn "本项目不需要系统 cuDNN（paddle 用 pip 装的 nvidia-cudnn-cu12），可安全移除："
+            printf '%s\n' "${broken_src}" | sed 's/^/    rm -f /' >&2
+            warn "删掉后重跑本脚本即可。"
+        fi
+        warn "若下面的 apt-get install 报 'Unable to locate package'，说明官方源索引也没成功，先修源。"
+    fi
     run env DEBIAN_FRONTEND=noninteractive \
         apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends "${packages[@]}"
 
-    # 显式验证 libgomp1：这是最容易漏、报错最难读的一项
+    # 显式验证 libgomp1：这是最容易漏、报错最难读的一项。
+    #
+    # 不能用 `ldconfig -p | grep` 当唯一判据，它有两个与"库到底在不在"无关的
+    # 失败方式：
+    #   ① ldconfig 本身不在 PATH 里（它在 /usr/sbin；被裁过的镜像、
+    #      或 PATH 被宝塔之类的面板改过时找不到）→ 命令失败，grep 无输入
+    #   ② 包刚装上，但 postinst 触发的 ldconfig 没跑到（安装被中断、
+    #      容器里没有 ldconfig），缓存里就还没有它
+    # 这两种情况下文件明明在位，paddle 也能 dlopen 到，却会被判成"没装上"。
+    # 所以主判据用 dpkg 定位真实文件，ldconfig 只作辅助，缺缓存就顺手重建。
     if [ "${DRY_RUN}" -eq 0 ]; then
-        ldconfig -p 2>/dev/null | grep -q 'libgomp\.so\.1' \
-            || die "libgomp1 装上了但 ldconfig 里没有 libgomp.so.1，paddle 会启动失败。请检查 apt 是否真的成功。"
+        local gomp
+        gomp="$(dpkg -L libgomp1 2>/dev/null \
+            | grep -E '/libgomp\.so\.1(\.[0-9]+)*$' | head -n 1 || true)"
+
+        if [ -z "${gomp}" ] || [ ! -e "${gomp}" ]; then
+            # 两种可能：包没装上（dpkg -L 为空），或 dpkg 记录与实际文件不一致
+            local st
+            st="$(dpkg-query -W -f='${Status}' libgomp1 2>/dev/null || echo '未安装')"
+            die "找不到 libgomp.so.1，paddle 会启动即失败（cannot open shared object file）。
+  当前 dpkg 状态：${st}
+  处理：apt-get install --reinstall -y libgomp1
+  若仍失败，看 apt 是否被第三方源挡住（apt-get update 的输出）。"
+        fi
+
+        # ldconfig 通常在 /usr/sbin，非 root 交互式 shell 的 PATH 里常没有它
+        # （sudo 会补，但宝塔/自建 systemd 环境不一定）。先认绝对路径，
+        # 否则 `command -v ldconfig` 会失败，把"PATH 里没有"误报成"系统没装"。
+        local ldc=""
+        if [ -x /usr/sbin/ldconfig ]; then
+            ldc=/usr/sbin/ldconfig
+        elif [ -x /sbin/ldconfig ]; then
+            ldc=/sbin/ldconfig
+        elif command -v ldconfig >/dev/null 2>&1; then
+            ldc="$(command -v ldconfig)"
+        fi
+
+        if [ -n "${ldc}" ]; then
+            if ! "${ldc}" -p 2>/dev/null | grep -q 'libgomp\.so\.1'; then
+                warn "ldconfig 缓存里还没有 libgomp.so.1（文件在 ${gomp}），重建缓存"
+                "${ldc}" || warn "ldconfig 执行失败；文件在位，动态链接器一般仍能从默认路径找到它"
+            fi
+        else
+            warn "找不到 ldconfig（libc-bin 可能被裁过），跳过缓存检查；文件在位即可正常 dlopen"
+        fi
+
+        log "libgomp1 就位：${gomp}"
     fi
 
     ok "系统依赖已安装（字体缺失不报错、只会画方块，稍后 doctor.py 会逐语言复核）"
@@ -549,10 +687,30 @@ step_uv() {
     CURRENT_STEP="安装 uv"
     log "${CURRENT_STEP}"
 
-    if command -v uv >/dev/null 2>&1; then
-        log "uv 已存在：$(uv --version 2>/dev/null || echo '版本未知')，跳过安装（幂等）"
+    # 判据必须是「降权执行时能不能用」，而不是「root 现在能不能用」。
+    # 这两者不等价：root 的 PATH 常含 /root/.local/bin、/root/.cargo/bin，
+    # 而 as_user 用的是固定 PATH。按 `command -v uv` 判会漏掉这种情况，
+    # 表现为检查通过、跑到 uv sync 才报 "env: 'uv': No such file or directory"。
+    if [ -x "${UV_BIN}" ]; then
+        log "uv 已就位：${UV_BIN}（$("${UV_BIN}" --version 2>/dev/null || echo '版本未知')），跳过安装（幂等）"
         ok "uv 已就绪"
         return 0
+    fi
+
+    # 系统里另有一份 uv（多半在 /root/.local/bin）：直接搬过来，不重复下载。
+    # 必须 **复制** 不能做软链 —— /root 是 0700，imgtrans 用户连目录都进不去，
+    # 软链会变成"存在但不可执行"，比没有更迷惑。
+    local found
+    found="$(command -v uv 2>/dev/null || true)"
+    if [ -n "${found}" ] && [ -x "${found}" ]; then
+        warn "uv 在 ${found}（不属于运行用户可见的 PATH），复制到 ${UV_BIN}"
+        run install -m 0755 "${found}" "${UV_BIN}"
+        if [ -x "${UV_BIN}" ]; then
+            log "已就位：${UV_BIN}（$("${UV_BIN}" --version 2>/dev/null || echo '版本未知')）"
+            ok "uv 已就绪"
+            return 0
+        fi
+        warn "复制失败，回退到联网安装"
     fi
 
     # 官方安装脚本 + UV_UNMANAGED_INSTALL：
@@ -564,22 +722,22 @@ step_uv() {
     # dry-run 下不 mktemp：否则每跑一次 dry-run 就在 /tmp 留一个空文件。
     if [ "${DRY_RUN}" -eq 1 ]; then
         printf '[dry-run] curl -fsSL -o /tmp/imgtrans-uv-install.XXXXXX.sh https://astral.sh/uv/install.sh\n'
-        printf '[dry-run] env UV_UNMANAGED_INSTALL=/usr/local/bin bash /tmp/imgtrans-uv-install.XXXXXX.sh\n'
+        printf '[dry-run] env UV_UNMANAGED_INSTALL=%s bash /tmp/imgtrans-uv-install.XXXXXX.sh\n' "$(dirname "${UV_BIN}")"
         printf '[dry-run] rm -f /tmp/imgtrans-uv-install.XXXXXX.sh\n'
-        ok "uv 将安装到 /usr/local/bin/uv"
+        ok "uv 将安装到 ${UV_BIN}"
         return 0
     fi
 
     local installer
     installer="$(mktemp /tmp/imgtrans-uv-install.XXXXXX.sh)"
     run curl -fsSL -o "${installer}" https://astral.sh/uv/install.sh
-    run env UV_UNMANAGED_INSTALL=/usr/local/bin bash "${installer}"
+    run env UV_UNMANAGED_INSTALL="$(dirname "${UV_BIN}")" bash "${installer}"
     run rm -f "${installer}"
 
-    [ -x /usr/local/bin/uv ] || die "uv 安装后不在 /usr/local/bin/uv。若是内网环境，请手动拷 uv 二进制到 /usr/local/bin/uv 后重跑本脚本。"
-    log "uv 版本：$(/usr/local/bin/uv --version)"
+    [ -x "${UV_BIN}" ] || die "uv 安装后不在 ${UV_BIN}。若是内网环境，请手动拷 uv 二进制到 ${UV_BIN} 并 chmod 755 后重跑本脚本。"
+    log "uv 版本：$("${UV_BIN}" --version)"
 
-    ok "uv 已安装到 /usr/local/bin/uv"
+    ok "uv 已安装到 ${UV_BIN}"
 }
 
 # ===========================================================================
@@ -636,7 +794,7 @@ step_files() {
         venv_existed=1
     fi
     run mkdir -p "${INSTALL_DIR}/.models" "${INSTALL_DIR}/out" "${INSTALL_DIR}/.tools" \
-        "${INSTALL_DIR}/.venv"
+        "${INSTALL_DIR}/.venv" "${UV_HOME}" "${UV_BIN_DIR}"
     run chown -R "root:${RUN_GROUP}" "${INSTALL_DIR}"
     run chown -R "${RUN_USER}:${RUN_GROUP}" \
         "${INSTALL_DIR}/.models" "${INSTALL_DIR}/out" "${INSTALL_DIR}/.tools" "${INSTALL_DIR}/.venv"
@@ -697,6 +855,17 @@ step_sync() {
     CURRENT_STEP="准备 Python 解释器"
     log "${CURRENT_STEP}"
 
+    # 整个步骤的所有动作都以绝对路径调 uv（见文件顶部 UV_BIN 的说明）。
+    # 这里先判一次：缺失时立刻说清，而不是等 uv python install 报 127 ——
+    # 那个退出码的原始信息是 "env: 'uv': No such file or directory"，
+    # 极容易被读成"权限不足"或"网络不通"，然后白查一轮。
+    if [ "${DRY_RUN}" -eq 0 ] && [ ! -x "${UV_BIN}" ]; then
+        die "找不到可执行的 uv：${UV_BIN}
+  多半是 uv 装在 root 自己的 PATH 里（如 /root/.local/bin），而运行用户 ${RUN_USER}
+  的 PATH 不含它。处理：sudo install -m 0755 \"\$(command -v uv)\" ${UV_BIN}
+  若系统里确实没有 uv，重跑本脚本的「安装 uv」步骤（会从 astral.sh 下载）。"
+    fi
+
     # 托管解释器必须落在安装目录内，不能吃 uv 的默认位置（~/.local/share/uv/python）：
     #   * 运行用户是 --no-create-home 建的，root 装在家目录里的那份它读不到；
     #   * systemd 单元开了 ProtectHome=yes，运行时 /home 与 /root 直接不可见。
@@ -713,13 +882,20 @@ step_sync() {
     else
         log "安装 uv 托管的 Python ${DESIRED_PY} 到 ${UV_PYTHON_DIR}"
         # 不用系统 python3 建 venv：22.04 的 3.10 不满足 requires-python
-        if as_user uv python install "${DESIRED_PY}"; then
+        local py_rc=0
+        as_user "${UV_BIN}" python install "${DESIRED_PY}" || py_rc=$?
+        if [ "${py_rc}" -eq 0 ]; then
             PY_SPEC="${DESIRED_PY}"
             py_managed=1
         else
             # 离线/内网下载失败 → 降级到系统解释器，而不是直接失败。
             # 这一步必须显式提示：版本与验证环境不同，出问题时先想到这一点。
-            warn "无法通过 uv 下载 Python ${DESIRED_PY}（离线/内网？），改为使用系统解释器"
+            # 退出码写进日志：127 是"命令找不到"，与"网络下载失败"完全无关，
+            # 不说清楚会被误读成后者（本机曾因此白查一轮）。
+            warn "uv python install 失败（退出码 ${py_rc}），改为使用系统解释器"
+            if [ "${py_rc}" -eq 127 ]; then
+                warn "退出码 127 = 命令不存在，不是网络问题：检查 ${UV_BIN}"
+            fi
             PY_SPEC="$(pick_system_python)" || die "既装不上托管 ${DESIRED_PY}，系统里也没有 3.11~3.13。
   离线环境请在有网机器执行 'uv python install ${DESIRED_PY}'，把生成的
   ${UV_PYTHON_DIR}/cpython-${DESIRED_PY}* 整个目录拷到目标机后重跑本脚本。"
@@ -777,8 +953,17 @@ step_sync() {
         run chmod g+w "${INSTALL_DIR}"
     fi
 
+    # 前置校验：走绝对路径，但先确认它真的存在且可执行。
+    # 少了这一句，uv 缺失时会一路跑到 sync 才报 127，而 127 的原始信息
+    # "env: 'uv': No such file or directory" 会被当成"权限/网络"问题去查。
+    if [ "${DRY_RUN}" -eq 0 ]; then
+        [ -x "${UV_BIN}" ] || die "找不到可执行的 uv：${UV_BIN}
+  处理：sudo install -m 0755 \"\$(command -v uv)\" ${UV_BIN}
+  （root 的 PATH 里有 uv，但运行用户 ${RUN_USER} 的 PATH 里没有，属于常见的错位。）"
+    fi
+
     local sync_rc=0
-    as_user uv "${sync_args[@]}" || sync_rc=$?
+    as_user "${UV_BIN}" "${sync_args[@]}" || sync_rc=$?
 
     if [ "${DRY_RUN}" -eq 0 ] && [ -n "${dir_mode}" ]; then
         run chmod "${dir_mode}" "${INSTALL_DIR}"
@@ -815,8 +1000,15 @@ step_sync() {
         # 了这一项、推理时才炸 "no kernel image is available"。所以这里查运行时
         # 真判据 device_count()，顺便把计算能力打出来备查。
         if [ "${DRY_RUN}" -eq 0 ]; then
-            local gpu_probe count cap
-            gpu_probe="$(runuser -u "${RUN_USER}" -- "${INSTALL_DIR}/.venv/bin/python" -c '
+            # 探测脚本除了设备数，还把**实际加载的 libcuda.so.1 路径**打出来。
+            # 803 = CUDA_ERROR_SYSTEM_DRIVER_MISMATCH，字面意思是"用户态 CUDA
+            # 驱动与内核驱动不匹配"。它的头号成因不是驱动装错，而是加载到了
+            # bundled/compat 那份 libcuda（CUDA toolkit 的 /compat 目录），
+            # 而不是宿主驱动提供的 /usr/lib/x86_64-linux-gnu/libcuda.so.1。
+            # 不打路径的话，这一项只能靠人瞎试。
+            local probe_py
+            probe_py='
+import ctypes
 import paddle
 print("cuda_compiled=%s" % paddle.device.is_compiled_with_cuda())
 print("device_count=%s" % paddle.device.cuda.device_count())
@@ -825,20 +1017,88 @@ try:
     print("capability=%s.%s" % (major, minor))
 except Exception as exc:
     print("capability=unknown(%s)" % exc)
-' 2>&1 || true)"
-            count="$(printf '%s\n' "${gpu_probe}" | sed -n 's/^device_count=//p' | tail -n 1)"
+try:
+    ctypes.CDLL("libcuda.so.1")
+    for line in open("/proc/self/maps"):
+        if "libcuda.so" in line:
+            print("libcuda=%s" % line.split()[-1])
+            break
+except Exception as exc:
+    print("libcuda=unavailable(%s)" % exc)
+'
+
+            # 判定口径：**总是**在清空 LD_LIBRARY_PATH 的环境里判，而不是等
+            # 发现本进程有这个变量才重试。
+            #
+            # 这条踩过一次：上一版写成 `if [ -n "${LD_LIBRARY_PATH:-}" ]` 才重试，
+            # 结果父 shell 里它是空的（root 的登录环境没设），变量是 runuser 走
+            # PAM 时由 /etc/environment 注入子进程的 —— 条件不成立，重试根本没跑，
+            # 自检照样报 803，日志里连"已定位/已排除"都没有，看着像没改过。
+            #
+            # 口径对不对也有依据：systemd 单元里写的是 Environment="LD_LIBRARY_PATH="
+            # （置空），服务真正运行的环境就是干净的，自检必须用同一个口径。
+            local raw_probe clean_probe count cap
+            clean_probe="$(runuser -u "${RUN_USER}" -- env -u LD_LIBRARY_PATH \
+                "${INSTALL_DIR}/.venv/bin/python" -c "${probe_py}" 2>&1 || true)"
+            count="$(printf '%s\n' "${clean_probe}" | sed -n 's/^device_count=//p' | tail -n 1)"
+
             if [ "${count:-0}" -ge 1 ] 2>/dev/null; then
-                cap="$(printf '%s\n' "${gpu_probe}" | sed -n 's/^capability=//p' | tail -n 1)"
+                cap="$(printf '%s\n' "${clean_probe}" | sed -n 's/^capability=//p' | tail -n 1)"
                 log "GPU 自检通过：${count} 个可用设备，计算能力 sm_${cap}"
                 case "${cap}" in
                     12.*|10.*)
                         log "识别到 Blackwell（sm_${cap}）：kernel 来自 pyproject 的 cu129 源，cu126 的 wheel 不含这一代" ;;
                 esac
+
+                # 干净环境能过、不清理过不了 → 那个变量就是唯一变量。服务侧不受
+                # 影响（unit 已置空），但人手跑 serve.py / ocr_bench.py 还会撞。
+                raw_probe="$(runuser -u "${RUN_USER}" -- \
+                    "${INSTALL_DIR}/.venv/bin/python" -c "${probe_py}" 2>&1 || true)"
+                if ! printf '%s\n' "${raw_probe}" | grep -q '^device_count=[1-9]'; then
+                    warn "留意：不清理 LD_LIBRARY_PATH 时 device_count=0（CUDA error 803）。"
+                    warn "  服务不受影响——unit 里已 Environment=\"LD_LIBRARY_PATH=\" 置空；"
+                    warn "  但手动跑 python scripts/serve.py / scripts/ocr_bench.py 前要先 unset。"
+                    local srcs
+                    srcs="$(ld_library_path_sources || true)"
+                    if [ -n "${srcs}" ]; then
+                        warn "  注入源（删掉或注释掉下面这几行）："
+                        printf '%s\n' "${srcs}" | sed 's/^/      /' >&2
+                    else
+                        warn "  常见位置没找到注入源，用这条查："
+                        warn "    grep -rn LD_LIBRARY_PATH /etc/environment /etc/profile.d /root/.bashrc"
+                    fi
+                fi
             else
-                warn "GPU 自检未通过（device_count=0）：paddle 能看到驱动，但看不到可用设备。"
-                printf '%s\n' "${gpu_probe}" | sed 's/^/    /' >&2
-                warn "常见原因：驱动刚升级没重启、容器没透传 GPU、MIG 配置、或装成了 CPU 版 paddle。"
-                warn "先降级上线：把 ${ENV_FILE} 的 IMGTRANS_DEVICE 改成 cpu，restart 后再排查。"
+                warn "GPU 自检未通过（device_count=${count:-0}）：paddle 能看到驱动，但看不到可用设备。"
+                warn "  ↑ 以上是清空 LD_LIBRARY_PATH 之后的输出，也就是服务实际运行的环境"
+                printf '%s\n' "${clean_probe}" | sed 's/^/    /' >&2
+                case "${clean_probe}" in
+                    *803*)
+                        warn "803 = CUDA_ERROR_SYSTEM_DRIVER_MISMATCH：用户态 libcuda 与内核驱动版本不一致。" ;;
+                esac
+
+                # 清空后仍失败，就不是 LD_LIBRARY_PATH 的事。但还有一处常被漏掉：
+                # 有人把 compat 目录写进了 ld.so.conf.d —— 那是全局并进 ld 缓存，
+                # env -u 管不到它，所以这里要把加载路径打出来对照。
+                local loaded
+                loaded="$(printf '%s\n' "${clean_probe}" | sed -n 's/^libcuda=//p' | tail -n 1)"
+                if [ -n "${loaded}" ]; then
+                    warn "paddle 实际加载的驱动库：${loaded}"
+                    case "${loaded}" in
+                        */compat/*)
+                            warn "  ↑ 这是 CUDA toolkit 的 forward-compat 垫片，不是宿主驱动。"
+                            warn "    清空 LD_LIBRARY_PATH 也没甩掉，说明它来自 ld 缓存："
+                            warn "    grep -rn compat /etc/ld.so.conf /etc/ld.so.conf.d/ 改完再 ldconfig" ;;
+                        /usr/lib/*|/lib/*)
+                            log "  ↑ 是宿主驱动那份，路径正常。" ;;
+                    esac
+                fi
+                warn "进一步排查（逐条跑）："
+                warn "  cat /proc/driver/nvidia/version            # 内核模块版本，应与 nvidia-smi 一致"
+                warn "  nvidia-smi --query-gpu=driver_version --format=csv,noheader"
+                warn "  ls -l /usr/lib/x86_64-linux-gnu/libcuda.so*  # 宿主驱动这份的版本后缀"
+                warn "  ls -l /usr/local/cuda*/compat/libcuda.so* 2>/dev/null  # 若有，多半就是它"
+                warn "先降级上线：把 ${ENV_FILE} 的 IMGTRANS_DEVICE 改成 cpu 再 restart。"
             fi
         fi
     fi
@@ -1054,7 +1314,7 @@ step_doctor() {
     local code=0
     # 关掉 errexit 才有机会拿到退出码并原样打印输出（doctor 有 FAIL 时返回 1）
     set +e
-    output="$(runuser -u "${RUN_USER}" -- env "HOME=${INSTALL_DIR}" \
+    output="$(runuser -u "${RUN_USER}" -- env "HOME=${UV_HOME}" \
         bash -c "cd $(q "${INSTALL_DIR}") && exec .venv/bin/python scripts/doctor.py" 2>&1)"
     code=$?
     set -e
