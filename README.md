@@ -136,6 +136,10 @@ uv run python scripts/translate_image.py --input a.jpg --to en --dry-run
 
 `--to` 取值见 `imgtrans/translator/lang_map.py` 的 `SUPPORTED_LANGS`（35 个，不含中文——中文是源语言）。
 
+**语言码统一按 Google 风格传**（`ja` / `ko` / `fr` / `es` / `he`）。百度通道用的是另一套写法
+（`jp` / `kor` / `fra` / `spa` / `heb`），服务内部会自己映射；如果你手边已有百度写法，
+直接传也能用，两种写法完全等价，返回与日志里只会出现 Google 风格。
+
 ## HTTP API
 
 | 方法 | 路径 | 用途 |

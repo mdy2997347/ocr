@@ -33,7 +33,13 @@ from imgtrans.translator.baidu import (
     _FatalCircuit,
     make_sign,
 )
-from imgtrans.translator.lang_map import SUPPORTED_LANGS, to_baidu_lang
+from imgtrans.translator.lang_map import (
+    BAIDU_LANGS,
+    SUPPORTED_LANGS,
+    is_supported_lang,
+    normalize_lang,
+    to_baidu_lang,
+)
 
 APPID = "2015063000000001"
 SECRET = "12345678"
@@ -472,6 +478,89 @@ class TestLangMap(unittest.TestCase):
         """``ja-JP`` / ``EN_us`` 退到主语言子标签。"""
         self.assertEqual(to_baidu_lang("ja-JP"), "jp")
         self.assertEqual(to_baidu_lang("EN_us"), "en")
+
+
+class TestBaiduStyleCompat(unittest.TestCase):
+    """入口兼容百度写法，但对外只认 Google 风格。
+
+    契约：调用方按哪种写法传都能过，归一后**完全等价**；
+    百度码不会泄漏到响应/日志，只出现在上送百度的 ``target_code`` 上。
+    """
+
+    def test_all_baidu_codes_normalize_to_google_codes(self) -> None:
+        """21 个写法不同的百度码，逐个归一到项目规范码。"""
+        pairs = {
+            "ara": "ar",
+            "bul": "bg",
+            "ben": "bn",
+            "dan": "da",
+            "spa": "es",
+            "est": "et",
+            "fin": "fi",
+            "fra": "fr",
+            "heb": "he",
+            "hrv": "hr",
+            "jp": "ja",
+            "geo": "ka",
+            "kor": "ko",
+            "may": "ms",
+            "nor": "no",
+            "rom": "ro",
+            "slo": "sk",
+            "slv": "sl",
+            "swe": "sv",
+            "ukr": "uk",
+            "vie": "vi",
+        }
+        for baidu_code, expected in pairs.items():
+            with self.subTest(code=baidu_code):
+                self.assertEqual(normalize_lang(baidu_code), expected)
+                self.assertTrue(is_supported_lang(baidu_code))
+
+    def test_every_supported_lang_accepts_its_baidu_form(self) -> None:
+        """35 个语言：Google 写法与其百度写法归一到**同一个**规范码。"""
+        for code in SUPPORTED_LANGS:
+            baidu_code = BAIDU_LANGS[code]
+            with self.subTest(code=code, baidu=baidu_code):
+                self.assertEqual(normalize_lang(code), code)
+                self.assertEqual(normalize_lang(baidu_code), code)
+                # 两种写法最终上送百度的码必须一致
+                self.assertEqual(to_baidu_lang(baidu_code), baidu_code)
+
+    def test_case_and_separator_insensitive(self) -> None:
+        """``JP`` / `` jp `` / ``FRA`` 与规范码等价（``ja_JP`` 走子标签）。"""
+        self.assertEqual(normalize_lang("JP"), "ja")
+        self.assertEqual(normalize_lang("  kor  "), "ko")
+        self.assertEqual(normalize_lang("FRA"), "fr")
+        self.assertEqual(normalize_lang("ja_JP"), "ja")
+        self.assertEqual(normalize_lang("slv"), "sl")
+        self.assertEqual(normalize_lang("slo"), "sk")
+
+    def test_iso_variants(self) -> None:
+        """与百度码易混的正确 ISO 639-3 码（kat/slk/ron/msa）也收。"""
+        self.assertEqual(normalize_lang("kat"), "ka")
+        self.assertEqual(normalize_lang("slk"), "sk")
+        self.assertEqual(normalize_lang("ron"), "ro")
+        self.assertEqual(normalize_lang("msa"), "ms")
+
+    def test_ambiguous_rom_follows_baidu(self) -> None:
+        """``rom`` 在 ISO 639-3 里是罗姆语，百度指罗马尼亚语——跟随百度口径。"""
+        self.assertEqual(normalize_lang("rom"), "ro")
+        self.assertEqual(to_baidu_lang("rom"), "rom")
+
+    def test_chinese_still_rejected_as_target(self) -> None:
+        """中文只作源语言：cht / zh-TW 能映射给百度，但**不能**当目标语言。"""
+        for code in ("zh", "zh-CN", "zh-TW", "cht", "chs", "yue"):
+            with self.subTest(code=code):
+                self.assertEqual(normalize_lang(code), "")
+                self.assertFalse(is_supported_lang(code))
+
+    def test_unknown_code_still_rejected(self) -> None:
+        """兼容不等于放行：没见过的码依旧拒绝，不猜。"""
+        for code in ("tlh", "xx", "klingon", "", None):
+            with self.subTest(code=code):
+                self.assertEqual(normalize_lang(code), "")
+                self.assertEqual(to_baidu_lang(code), "")
 
 
 class TestBuildTranslator(unittest.TestCase):

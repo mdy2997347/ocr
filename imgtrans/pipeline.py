@@ -545,6 +545,7 @@ def _require_target_lang(code: str) -> str:
     raise UnsupportedLangError(
         f"不支持的目标语言: {code!r}；支持 {len(SUPPORTED_LANGS)} 种: "
         + ", ".join(SUPPORTED_LANGS)
+        + "（也接受百度风格码 jp/kor/fra/spa 等，内部会归一为上述写法）"
     )
 
 

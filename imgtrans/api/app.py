@@ -55,7 +55,13 @@ _ERROR_STATUS: dict[str, int] = {
 
 class TranslateRequest(BaseModel):
     url: str = Field(..., description="远程图片地址（http/https）")
-    target: str = Field(..., description="目标语言码，见 GET /v1/languages；如 en / ja / ko")
+    target: str = Field(
+        ...,
+        description=(
+            "目标语言码，见 GET /v1/languages；统一用 Google 写法（en / ja / ko）。"
+            "百度写法（jp / kor / fra / spa）也接受，服务内部会归一，两者完全等价"
+        ),
+    )
     source: str | None = Field(None, description="源语言码，不传则按默认 OCR 语言（中文）识别")
     render: bool = Field(True, description="是否把译文回填到图中")
 
@@ -328,7 +334,14 @@ def create_app(
     @app.post("/v1/translate/upload", dependencies=[auth])
     def translate_upload(
         file: Annotated[UploadFile, File(description="图片文件")],
-        target: Annotated[str, Form(description="目标语言码，见 GET /v1/languages")],
+        target: Annotated[
+            str,
+            Form(
+                description=(
+                    "目标语言码，见 GET /v1/languages；百度写法（jp/kor/fra）也接受"
+                )
+            ),
+        ],
         source: Annotated[str | None, Form()] = None,
         detailed: Annotated[int, Query()] = 0,
     ) -> Response:

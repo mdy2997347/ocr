@@ -49,7 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--target",
         "-t",
         default="zh-CN",
-        help="目标语言代码（默认 zh-CN）",
+        help="目标语言代码（默认 zh-CN）；统一用 Google 写法（ja/ko/fr），"
+        "百度写法（jp/kor/fra）也接受，内部自动映射",
     )
     parser.add_argument(
         "--source",

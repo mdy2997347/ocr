@@ -15,8 +15,12 @@
 3. 原 ``auto()`` 里的 ``strtolower($auto)`` 与表中 ``zh-Hans`` / ``zh-Hant``
    两个混合大小写键不匹配（PHP 数组键大小写敏感），导致简繁识别永远失败。
    本移植的 :func:`lookup_auto` 做大小写无关匹配，修正该缺陷；
-4. 新增 :data:`SUPPORTED_LANGS` 目标语言白名单（业务侧定的 34 个码），
-   PHP 原版没有这个概念，任何字符串都会被透传给 Google，拼错只能等远端报错。
+4. 新增 :data:`SUPPORTED_LANGS` 目标语言白名单（业务侧定的 35 个码），
+   PHP 原版没有这个概念，任何字符串都会被透传给 Google，拼错只能等远端报错；
+5. **对外只有一种写法**：Google 风格（``ja`` / ``ko`` / ``fr``）。百度用的
+   ``jp`` / ``kor`` / ``fra`` 由 :data:`_BAIDU_STYLE_ALIASES` 在入口收下、
+   归一成 Google 风格，再由 :func:`to_baidu_lang` 内部翻回去。调用方传哪种
+   都能过，但日志、响应、以及对 Google 的上送永远不出现百度码。
 """
 
 from __future__ import annotations
@@ -90,6 +94,55 @@ _LANG_ALIASES: dict[str, str] = {
     "no-nyn": "no",
     "zh": "zh-cn",  # 仅用于源语言识别，不在目标白名单内
 }
+
+#: **百度风格码 → 规范码**（反向别名，见 :func:`to_baidu_lang` 的上行）。
+#:
+#: 契约是"对外统一按 Google 风格传 ``lang``，百度内部再映射"。可现实中调用方
+#: 会直接抄百度文档或百度 demo 里的码（``jp`` / ``kor`` / ``fra`` / ``ara``），
+#: 一律 400 既不合理也难排查。所以这里把百度码全收，归一后与 Google 风格
+#: **完全等价**：``jp`` 和 ``ja`` 最终走的是同一条映射、同一个百度码。
+#:
+#: 三个需要留意的点：
+#:
+#: * ``rom`` 在 ISO 639-3 里是**罗姆语**（Romany），百度拿它表示罗马尼亚语。
+#:   这里跟随百度口径映射到 ``ro``——本项目对接的是百度接口，不是语言学界，
+#:   真要译罗姆语请显式走 Google 通道；
+#: * ``slo``（斯洛伐克语）与 ``slv``（斯洛文尼亚语）只差一个字母，百度码取自
+#:   旧版 ISO 639-2/B，而这两个词在 639-3 里恰好对调认知，别按语感猜；
+#: * ``kat`` / ``slk`` / ``ron`` / ``msa`` 不是百度码，是这几门语言的**正确**
+#:   ISO 639-3 码，收下是因为它们与百度码最容易混传（``ka`` 的 639-3 是
+#:   ``kat`` 而非百度认的 ``geo``）。
+_BAIDU_STYLE_ALIASES: dict[str, str] = {
+    "ara": "ar",
+    "ben": "bn",
+    "bul": "bg",
+    "dan": "da",
+    "est": "et",
+    "fin": "fi",
+    "fra": "fr",
+    "geo": "ka",
+    "heb": "he",
+    "hrv": "hr",
+    "jp": "ja",
+    "kor": "ko",
+    "may": "ms",
+    "nor": "no",
+    "rom": "ro",
+    "slo": "sk",
+    "slv": "sl",
+    "spa": "es",
+    "swe": "sv",
+    "ukr": "uk",
+    "vie": "vi",
+    # 与百度码易混的标准 ISO 639-3 写法
+    "kat": "ka",
+    "msa": "ms",
+    "ron": "ro",
+    "slk": "sk",
+}
+
+_LANG_ALIASES.update(_BAIDU_STYLE_ALIASES)
+
 
 _SUPPORTED_SET = frozenset(SUPPORTED_LANGS)
 
@@ -181,6 +234,7 @@ _BAIDU_SOURCE_ALIASES: dict[str, str] = {
     "zh": "zh",
     "zh-cn": "zh",
     "zh-hans": "zh",
+    "chs": "zh",  # 百度旧码，简体
     "zh-tw": "cht",
     "zh-hk": "cht",
     "zh-hant": "cht",
@@ -193,8 +247,12 @@ _BAIDU_SOURCE_ALIASES: dict[str, str] = {
 def normalize_lang(code: str | None) -> str:
     """把调用方传入的语言码归一成 :data:`SUPPORTED_LANGS` 里的规范码。
 
-    接受并归一的形式：``EN`` / `` en `` / ``pt-BR`` / ``pt_br`` / ``iw``（旧码）。
+    接受并归一的形式：``EN`` / `` en `` / ``pt-BR`` / ``pt_br`` / ``iw``（旧码）
+    / ``jp`` / ``kor`` / ``fra``（百度风格，见 :data:`_BAIDU_STYLE_ALIASES`）。
     归一之后才能拿去查白名单——直接比对原文会把 ``en-US`` 判成不支持。
+
+    这是**入口唯一**的语言码收敛点：HTTP、CLI、pipeline 都走它，所以"统一按
+    Google 风格传 lang"这条契约只需要在这里保证一次。
 
     Args:
         code: 调用方传入的语言码。
@@ -307,9 +365,13 @@ def is_supported_source(code: str | None) -> bool:
 def to_baidu_lang(code: str | None) -> str:
     """把语言码转成百度翻译认的码。
 
-    接受 ``EN`` / `` en `` / ``ja-JP`` / ``zh`` / ``auto`` 等形式。
-    先用完整码查 :data:`BAIDU_LANGS` 与 :data:`_BAIDU_SOURCE_ALIASES`，
-    再退到主语言子标签（``ja-JP`` → ``ja`` → ``jp``）。
+    接受 ``EN`` / `` en `` / ``ja-JP`` / ``jp`` / ``fra`` / ``zh`` / ``auto``
+    等形式：先过 :data:`_BAIDU_SOURCE_ALIASES`（中文、粤语、文言文这类百度
+    独有码），再走 :func:`normalize_lang` 归一到规范码后查 :data:`BAIDU_LANGS`。
+    最后才退到主语言子标签（``ja-JP`` → ``ja`` → ``jp``）。
+
+    **这一步是单向的**：Google 风格进、百度风格出，不会把 ``jp`` 泄漏到
+    调用方看到的地方。
 
     Args:
         code: 语言代码。
@@ -322,9 +384,17 @@ def to_baidu_lang(code: str | None) -> str:
     key = code.strip().lower().replace("_", "-")
     if not key:
         return ""
+    # 源侧/百度独有码优先：``zh`` / ``cht`` / ``yue`` / ``wyw`` / ``auto`` 都不在
+    # SUPPORTED_LANGS 里，归一化会给空串，必须在下面之前命中。
     if key in _BAIDU_SOURCE_ALIASES:
         return _BAIDU_SOURCE_ALIASES[key]
+    # 统一走规范码：``ja`` / ``JA`` / ``ja-JP`` / ``jp`` 四种写法在这里汇合，
+    # 之后只有一个出处——BAIDU_LANGS。
+    canonical = normalize_lang(key)
+    if canonical:
+        return BAIDU_LANGS[canonical]
     if key in BAIDU_LANGS:
+        # 兜底：将来若 BAIDU_LANGS 收进不在白名单里的键，直接查也能命中。
         return BAIDU_LANGS[key]
     primary = key.split("-", 1)[0]
     if primary in _BAIDU_SOURCE_ALIASES:
