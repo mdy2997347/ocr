@@ -42,9 +42,17 @@ gpu = ["paddlepaddle-gpu==3.3.1"]
 
 # GPU 版 paddle 不在 PyPI，只能从官方源装；explicit=true 表示
 # 只给显式引用它的包用，不会污染其它包的解析。
+#
+# 为什么是 cu129 而不是 cu126：cu126 的 wheel 只编译到 sm_90（Hopper），
+# Blackwell（RTX 50 系列，sm_120）的 kernel 从 CUDA 12.8 才有。装 cu126 在
+# RTX 5090 上的表现是 import 正常、is_compiled_with_cuda() 也返回 True，
+# 一推理就炸 "no kernel image is available for execution on the device" ——
+# 自检拦不住，只能靠源选对。官方兼容表把 sm_120 明确归到 cu129/cu130。
+# 代价：wheel 从 2.0GB 变成 2.9GB（多了 sm_100/sm_120 的 kernel）。
+# cu129 的轮子同时含 sm_80/86/89/90，老卡（T4、3090、4090、H100）照常可用。
 [[tool.uv.index]]
 name = "paddle-gpu"
-url = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu129/"
 explicit = true
 
 [tool.uv.sources]
