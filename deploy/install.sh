@@ -358,12 +358,21 @@ ld_library_path_sources() {
     for f in /etc/profile.d/*.sh; do
         [ -f "${f}" ] && files+=("${f}")
     done
+    # 调用者的 shell 初始化文件也要查：脚本继承的是"谁启动它"的环境。
+    # 实测出现过 /etc 下全部干净、但父 shell 里带着 /usr/local/cuda/lib64 的情况，
+    # 那时只查 /etc 会得出"没有注入源"的结论，反而更迷惑。
+    for f in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.bash_profile" "${HOME:-/root}/.profile" \
+             /root/.bashrc /root/.profile; do
+        [ -f "${f}" ] && files+=("${f}")
+    done
     if [ "${#files[@]}" -eq 0 ]; then
         return 0
     fi
-    # 过滤掉注释行：注释掉的 export 不生效，列出来只会增加噪音
+    # 过滤掉注释行：注释掉的 export 不生效，列出来只会增加噪音。
+    # 同一文件可能被重复加入（例如 HOME=/root），sort -u 去重。
     grep -Hn 'LD_LIBRARY_PATH' "${files[@]}" 2>/dev/null \
         | grep -v ':[0-9]*:[[:space:]]*#' \
+        | sort -u \
         || true
 }
 
@@ -1058,6 +1067,13 @@ except Exception as exc:
                     warn "留意：不清理 LD_LIBRARY_PATH 时 device_count=0（CUDA error 803）。"
                     warn "  服务不受影响——unit 里已 Environment=\"LD_LIBRARY_PATH=\" 置空；"
                     warn "  但手动跑 python scripts/serve.py / scripts/ocr_bench.py 前要先 unset。"
+                    # 把"从哪儿来"说清楚：本进程有值 → 继承自启动脚本的 shell；
+                    # 本进程没有却传给了子进程 → 只能是 runuser/PAM 注入的。
+                    if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+                        warn "  当前进程的值：${LD_LIBRARY_PATH}"
+                    else
+                        warn "  本进程里它是空的 → 是 runuser 走 PAM 注入给子进程的"
+                    fi
                     local srcs
                     srcs="$(ld_library_path_sources || true)"
                     if [ -n "${srcs}" ]; then
@@ -1312,12 +1328,18 @@ step_doctor() {
 
     local output=""
     local code=0
-    # 关掉 errexit 才有机会拿到退出码并原样打印输出（doctor 有 FAIL 时返回 1）
-    set +e
-    output="$(runuser -u "${RUN_USER}" -- env "HOME=${UV_HOME}" \
-        bash -c "cd $(q "${INSTALL_DIR}") && exec .venv/bin/python scripts/doctor.py" 2>&1)"
-    code=$?
-    set -e
+    # 想拿退出码又不触发 ERR trap，只有 `|| code=$?` 这一种写法。
+    # 外面套 set +e 是无效的 —— ERR trap 不受 errexit 控制（实测：set +e 之后
+    # 命令失败，trap 照样触发），于是 doctor 报 FAIL 时直接走 on_err 退出，
+    # 它自己的输出一个字都没打出来。现场日志就是这个样子：只剩一行
+    # "第 1318 行执行失败"，看不到到底哪一项 FAIL，等于把诊断信息丢了。
+    # 放在 || 右侧的命令属于"失败不触发 trap"的列表，才真能兜住。
+    #
+    # env -u LD_LIBRARY_PATH 与 as_user、systemd 单元同一口径：服务运行时这个
+    # 变量是空的，自检也必须按空环境判。否则 GPU 机器上会加载 compat 版 libcuda
+    # 报 CUDA error(803)，doctor 判 E_DEVICE FAIL，装到最后一个步骤才失败。
+    output="$(runuser -u "${RUN_USER}" -- env -u LD_LIBRARY_PATH "HOME=${UV_HOME}" \
+        bash -c "cd $(q "${INSTALL_DIR}") && exec .venv/bin/python scripts/doctor.py" 2>&1)" || code=$?
 
     printf '%s\n' "${output}"
 
@@ -1332,6 +1354,10 @@ step_doctor() {
   * 推理报 “no kernel image is available” → 驱动或 wheel 的架构代对不上：
                               RTX 50 系列（sm_120）要 cu129/cu130 的 wheel，cu126 没有它的 kernel
 EOF
+        # 给出"不进安装流程也能复跑"的命令：改一行配置再验证时，不必重跑
+        # 前面七步（虽然幂等，但 uv sync 与 apt 检查每次都要几十秒）。
+        printf '原样复跑（与上面输出一致）：\n  cd %s && sudo -u %s env -u LD_LIBRARY_PATH HOME=%s .venv/bin/python scripts/doctor.py\n\n' \
+            "${INSTALL_DIR}" "${RUN_USER}" "${UV_HOME}" >&2
         die "${CURRENT_STEP}未通过"
     fi
 
