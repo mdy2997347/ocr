@@ -1474,11 +1474,63 @@ step_nginx() {
     fi
     log "${CURRENT_STEP}"
 
+    # ---- 布局探测必须在"装包"之前 --------------------------------------------
+    # 这台机器的现场：宝塔面板，nginx 在 /www/server/nginx/sbin/nginx，常常不在
+    # PATH 里。于是 `command -v nginx` 为假 → 脚本 apt install nginx → 系统里
+    # 出现第二份 nginx 去抢 80 端口，整站挂掉。这个判断必须前置。
+    if [ -d /www/server/panel/vhost/nginx ]; then
+        warn "检测到宝塔/aaPanel 面板（/www/server/panel/vhost/nginx），站点由面板管理。"
+        warn "  脚本不写站点配置：同一 server_name 写两份会让 nginx 只认第一份"
+        warn "  （conflicting server name），而面板下次保存站点又会整份覆盖。"
+        # 顺手确认一下已有反代是不是指向本服务的端口 —— 端口不一致是史上最多的
+        # "配置都对但 502"，而且面板里改过端口的人不会想起来通知这里。
+        local f pp found=""
+        for f in /www/server/panel/vhost/nginx/*.conf; do
+            [ -f "${f}" ] || continue
+            pp="$(grep -oE 'proxy_pass[[:space:]]+https?://[^;]+' "${f}" 2>/dev/null | head -n 1 || true)"
+            case "${pp}" in
+                *":${EFFECTIVE_PORT}"*) found="${f}" ;;
+            esac
+        done
+        if [ -n "${found}" ]; then
+            ok "已有反代指向本端口：${found} → 127.0.0.1:${EFFECTIVE_PORT}"
+            grep -q 'client_max_body_size' "${found}" 2>/dev/null \
+                || warn "  该站点没有 client_max_body_size，20MB 图会 413；建议 64m"
+            grep -q 'proxy_read_timeout' "${found}" 2>/dev/null \
+                || warn "  该站点没有 proxy_read_timeout，OCR 慢时可能 504；建议 180s"
+        else
+            warn "  没找到指向 127.0.0.1:${EFFECTIVE_PORT} 的 proxy_pass。反代需自行确认："
+            warn "    proxy_pass http://127.0.0.1:${EFFECTIVE_PORT};"
+            warn "    client_max_body_size 64m;    # base64 膨胀 33%，20MB 图 = 27MB 请求体"
+            warn "    proxy_read_timeout 180s;     # 默认 60s 会把 OCR 请求掐断，表现为 504"
+        fi
+        CURRENT_STEP="配置 nginx 反代（面板管理，已跳过）"
+        return 0
+    fi
+
     if ! command -v nginx >/dev/null 2>&1; then
         run env DEBIAN_FRONTEND=noninteractive \
             apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends nginx
     else
         log "nginx 已安装：$(nginx -v 2>&1)，跳过安装（幂等）"
+    fi
+
+    # 非 Debian 布局（CentOS 的 conf.d、自编译 nginx）没有 sites-available。
+    # 原来直接往 sites-available 写 → "No such file or directory" 让整步以
+    # 第 137 行失败收场，而这时服务本身其实已经装好了，纯粹是白死一次。
+    if [ ! -d /etc/nginx/sites-available ]; then
+        if [ -d /etc/nginx/conf.d ]; then
+            warn "本机是 conf.d 布局（无 sites-available），脚本不改动 nginx，请手工加反代："
+        else
+            warn "本机 nginx 布局不认识（既无 sites-available 也无 conf.d），脚本不改动 nginx。"
+        fi
+        warn "  在 server 块里加："
+        warn "    location / { proxy_pass http://127.0.0.1:${EFFECTIVE_PORT}; }"
+        warn "    client_max_body_size 64m;"
+        warn "    proxy_read_timeout 180s;"
+        warn "  或者用 --no-nginx 重跑，本步骤会直接跳过。"
+        CURRENT_STEP="配置 nginx 反代（布局未知，已跳过）"
+        return 0
     fi
 
     local template="${SCRIPT_DIR}/nginx-imgtrans.conf"
