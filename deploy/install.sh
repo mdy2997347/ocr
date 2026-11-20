@@ -557,13 +557,25 @@ step_files() {
     # 目录与权限：
     #   代码 root 拥有、组可读、**组不可写** —— 服务降权后只能读，改不了自己的代码
     #   .models / out / .tools / .venv 归运行用户 —— 模型下载、输出、缓存都要写
-    run mkdir -p "${INSTALL_DIR}/.models" "${INSTALL_DIR}/out" "${INSTALL_DIR}/.tools"
+    #
+    # .venv 必须在这里就建出来并交给运行用户，不能等 uv sync 去建：
+    #   uv sync 是以运行用户身份执行的，而安装目录本身是 root:组 且组不可写（见下），
+    #   运行用户没有权限在安装目录里 mkdir，于是 uv 报
+    #   "failed to create directory <dir>/.venv: Permission denied (os error 13)"。
+    #   （空 .venv 会被 uv 直接填充；只有当里面的 venv 不合法时才会删了重建，
+    #    重建同样需要写父目录，那份临时权限由 step_sync 负责放开。）
+    local venv_existed=0
+    if [ -d "${INSTALL_DIR}/.venv" ]; then
+        venv_existed=1
+    fi
+    run mkdir -p "${INSTALL_DIR}/.models" "${INSTALL_DIR}/out" "${INSTALL_DIR}/.tools" \
+        "${INSTALL_DIR}/.venv"
     run chown -R "root:${RUN_GROUP}" "${INSTALL_DIR}"
     run chown -R "${RUN_USER}:${RUN_GROUP}" \
-        "${INSTALL_DIR}/.models" "${INSTALL_DIR}/out" "${INSTALL_DIR}/.tools"
+        "${INSTALL_DIR}/.models" "${INSTALL_DIR}/out" "${INSTALL_DIR}/.tools" "${INSTALL_DIR}/.venv"
 
     # chown 只改属主，不改模式：tar 解出来的文件若带 g+w（源目录权限松），
-    # "代码只读"就落空了。这里把可写位从组和其他人身上摘掉，但跳过三个需要写的目录。
+    # "代码只读"就落空了。这里把可写位从组和其他人身上摘掉，但跳过四个需要写的目录。
     if [ "${DRY_RUN}" -eq 0 ]; then
         find "${INSTALL_DIR}" -maxdepth 1 -mindepth 1 -type f -exec chmod go-w {} + 2>/dev/null || true
         local d
@@ -576,7 +588,7 @@ step_files() {
     fi
 
     # 已存在的 venv 可能是上次以别的用户/umask 建的，uv sync 会因权限失败，先修补
-    if [ -d "${INSTALL_DIR}/.venv" ]; then
+    if [ "${venv_existed}" -eq 1 ]; then
         log "检测到已有 .venv，修补属主后仅做增量 sync（幂等）"
         run chown -R "${RUN_USER}:${RUN_GROUP}" "${INSTALL_DIR}/.venv"
     fi
@@ -686,7 +698,31 @@ step_sync() {
         sync_args+=(--offline)
     fi
 
-    as_user uv "${sync_args[@]}"
+    # 安装目录顶层是 root:组、组不可写（服务因此改不了自己的代码）。但 uv 在 .venv
+    # 缺失或不合法时需要 **在安装目录里创建/删除 .venv**，这要求父目录可写 ——
+    # 之前就以 "failed to create directory .venv: Permission denied" 卡死在这里。
+    # 所以只在 uv sync 期间临时放开组写，目录模式先存下来，结束后无论成败都原样收回；
+    # 装完的最终权限仍与"代码只读"的设计一致。
+    local dir_mode=""
+    if [ "${DRY_RUN}" -eq 0 ]; then
+        dir_mode="$(stat -c '%a' "${INSTALL_DIR}" 2>/dev/null || true)"
+        run chown -R "${RUN_USER}:${RUN_GROUP}" "${INSTALL_DIR}/.venv" 2>/dev/null || true
+        run chmod g+w "${INSTALL_DIR}"
+    fi
+
+    local sync_rc=0
+    as_user uv "${sync_args[@]}" || sync_rc=$?
+
+    if [ "${DRY_RUN}" -eq 0 ] && [ -n "${dir_mode}" ]; then
+        run chmod "${dir_mode}" "${INSTALL_DIR}"
+    fi
+    if [ "${sync_rc}" -ne 0 ]; then
+        die "uv sync 失败（退出码 ${sync_rc}）。
+  * Permission denied → 检查 ${INSTALL_DIR} 属主为 root:${RUN_GROUP}，且 ${RUN_USER} 可写：
+      chown root:${RUN_GROUP} $(q "${INSTALL_DIR}") && chmod g+w $(q "${INSTALL_DIR}")
+  * 网络超时 → 需要能访问 PyPI；内网用 .wheels/ 搭配 IMGTRANS_DEPLOY_OFFLINE=1
+  * resolution failed → uv.lock 与 pyproject.toml 不同步，本地 uv lock 后重传"
+    fi
 
     if [ "${DRY_RUN}" -eq 0 ]; then
         [ -x "${INSTALL_DIR}/.venv/bin/python" ] \
