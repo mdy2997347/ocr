@@ -173,6 +173,12 @@ OCR_PROFILES: dict[str, dict[str, Any]] = {
 #: 默认档位。详见 :data:`OCR_PROFILES`。
 DEFAULT_OCR_PROFILE = "quality"
 
+#: 档位加载失败时退化到的档位。
+#:
+#: 单独定义成常量，是因为它不只用于回退，还用于**如实上报**：``/healthz``
+#: 的 ``ocr_profile_effective`` 要从这里取名，硬编码两次迟早写歪。
+FALLBACK_OCR_PROFILE = "quality"
+
 
 class OcrEngine:
     """线程安全的 PaddleOCR 单例封装。
@@ -247,15 +253,45 @@ class OcrEngine:
         self._det_limit_side_len = det_limit_side_len
 
         self._engines: dict[str, Any] = {}
+        #: ``lang -> 实际生效的档位``。fast 的检测模型是**额外下载**的，
+        #: 拿不到时会静默回退 quality——如果只报配置值，线上就会出现
+        #: "healthz 说 fast、实际跑 quality"这种自相矛盾的读数，
+        #: 2026-11 排查"fast 怎么没提速"时正是被这个读数误导了半天。
+        self._effective_profiles: dict[str, str] = {}
         self._lock = threading.Lock()
 
     @property
     def profile(self) -> str:
-        """生效的速度档位，供启动日志与 ``/healthz`` 展示。
+        """**配置**的档位（意图），供启动日志展示。
 
-        线上排查"这张图怎么比昨天慢"时，第一个要确认的就是它——档位是
-        配置项，光看响应体看不出来。
+        想知道实际跑了哪一档，看 :attr:`profile_effective`。
         """
+        return self._profile
+
+    @property
+    def degraded_langs(self) -> list[str]:
+        """已加载且实际回退到慢档的语言。空列表 = 已加载的全部生效。"""
+        return sorted(
+            lang
+            for lang, effective in self._effective_profiles.items()
+            if effective != self._profile
+        )
+
+    @property
+    def profile_effective(self) -> str:
+        """**实际**生效的档位。
+
+        任一语言回退即视为未生效（返回回退档位）：部分生效比全不生效更难发现，
+        耗时介于两档之间，看数字只会觉得"快了，但没快那么多"。
+
+        模型尚未加载时无从得知，返回配置值；此时 :attr:`degraded_langs` 为空
+        不代表已确认生效，只代表还没开始加载。
+        """
+        if not self._profile_kwargs:
+            # quality 档没有额外参数，它本来就是回退目标，不存在"被降级"。
+            return self._profile
+        if self.degraded_langs:
+            return FALLBACK_OCR_PROFILE
         return self._profile
 
     @property
@@ -290,7 +326,7 @@ class OcrEngine:
             kwargs["text_det_limit_side_len"] = int(self._det_limit_side_len)
 
         try:
-            return PaddleOCR(**kwargs)
+            engine = PaddleOCR(**kwargs)
         except TypeError as exc:
             # 2.x 不认这些参数，退化成最小构造。2.x 用 use_gpu 布尔而非 device 串，
             # 传错会二次 TypeError——这个分支已经不指望能测，只能按官方签名写。
@@ -300,7 +336,10 @@ class OcrEngine:
                 "use_angle_cls": True,
                 "use_gpu": self._device != "cpu",
             }
-            return PaddleOCR(**fallback)
+            engine = PaddleOCR(**fallback)
+            # 参数都不认，档位自然也落不下去。
+            self._effective_profiles[lang] = FALLBACK_OCR_PROFILE
+            return engine
         except Exception as exc:  # noqa: BLE001 - 见下
             # fast 档的检测模型要额外下载，也可能与当前 paddle 版本不匹配。
             # 这种时候退化成 quality（慢但能跑）远好过整站不可用：
@@ -314,9 +353,14 @@ class OcrEngine:
             )
             degraded = {k: v for k, v in kwargs.items() if k not in self._profile_kwargs}
             try:
-                return PaddleOCR(**degraded)
+                engine = PaddleOCR(**degraded)
             except Exception as inner:  # noqa: BLE001 - 回退也失败，只能报错
                 raise OcrError(f"PaddleOCR 初始化失败（含回退 quality）：{inner}") from inner
+            self._effective_profiles[lang] = FALLBACK_OCR_PROFILE
+            return engine
+
+        self._effective_profiles[lang] = self._profile
+        return engine
 
     def get(self, lang: str) -> Any:
         """取（或惰性构造）指定语言的引擎实例。"""

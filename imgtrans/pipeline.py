@@ -170,8 +170,23 @@ class ImageTranslatePipeline:
 
     @property
     def ocr_profile(self) -> str:
-        """生效的 OCR 速度档位（``quality`` / ``fast``），供 ``/healthz`` 展示。"""
+        """**配置**的 OCR 速度档位（``quality`` / ``fast``）。
+
+        注意这是意图而非结果：fast 的检测模型下载失败时会静默回退 quality，
+        而这里照样返回 ``fast``。要判断实际跑的是哪一档，用
+        :attr:`ocr_profile_effective`。
+        """
         return getattr(self._ocr, "profile", "unknown")
+
+    @property
+    def ocr_profile_effective(self) -> str:
+        """**实际**生效的 OCR 速度档位（任一语言回退即返回回退档位）。"""
+        return getattr(self._ocr, "profile_effective", self.ocr_profile)
+
+    @property
+    def ocr_degraded_langs(self) -> list[str]:
+        """实际回退到慢档的语言列表，空列表表示已加载的都没降级。"""
+        return list(getattr(self._ocr, "degraded_langs", []) or [])
 
     @property
     def translator(self) -> BaseTranslator:
@@ -192,10 +207,13 @@ class ImageTranslatePipeline:
             self._ocr.get("ch")
         except Exception as exc:  # noqa: BLE001 - 预热失败不应阻止服务启动
             logger.warning("OCR 预热失败（首次请求时会重试）: %s", exc)
+        # 日志里带上**实际**档位而非配置值：fast 的 mobile_det 下载失败会静默
+        # 回退 quality，只打配置值的话，看日志会以为提速已经生效。
         logger.info(
-            "warmup 完成，耗时 %.2fs（device=%s）",
+            "warmup 完成，耗时 %.2fs（device=%s，profile=%s）",
             time.perf_counter() - started,
             self._ocr.device,
+            self.ocr_profile_effective,
         )
 
     # ---------------- 主入口 ----------------

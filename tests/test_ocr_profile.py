@@ -120,6 +120,73 @@ class OcrBuildArgsTest(unittest.TestCase):
         self.assertIn("boom", str(ctx.exception))
 
 
+class EffectiveProfileTest(unittest.TestCase):
+    """``profile`` 是配置，``profile_effective`` 是实际。
+
+    2026-11 线上踩过：healthz 报 ``fast``，实际因为 mobile_det 下载失败一直在跑
+    quality，耗时自然没变。两个值分开报之后，一条 curl 就能看出真相。
+    """
+
+    def _engine(self, profile: str, fail_mobile: bool) -> OcrEngine:
+        def fake(**params):
+            if fail_mobile and "text_detection_model_name" in params:
+                raise RuntimeError("model not found: PP-OCRv5_mobile_det")
+            return "engine"
+
+        engine = OcrEngine(device="cpu", profile=profile)
+        with mock.patch("paddleocr.PaddleOCR", side_effect=fake):
+            engine._build("ch")
+        return engine
+
+    def test_fast_applied_reports_fast(self) -> None:
+        engine = self._engine("fast", fail_mobile=False)
+        self.assertEqual(engine.profile_effective, "fast")
+        self.assertEqual(engine.degraded_langs, [])
+
+    def test_fast_fallback_reports_quality(self) -> None:
+        """回退后必须报 quality，否则这个字段就失去意义。"""
+        engine = self._engine("fast", fail_mobile=True)
+        self.assertEqual(engine.profile, "fast")  # 配置仍是 fast
+        self.assertEqual(engine.profile_effective, "quality")  # 实际是 quality
+        self.assertEqual(engine.degraded_langs, ["ch"])
+
+    def test_partial_degradation_counts_as_not_effective(self) -> None:
+        """只要有一门语言回退，整体就算未生效。
+
+        部分生效比全不生效更容易骗人：耗时介于两档之间，看数字只会觉得
+        "快了，但没快那么多"。
+        """
+        engine = OcrEngine(device="cpu", profile="fast")
+        calls = {"n": 0}
+
+        def fake(**params):
+            if "text_detection_model_name" in params:
+                calls["n"] += 1
+                if calls["n"] > 1:  # 第二种语言才失败
+                    raise RuntimeError("model not found")
+            return "engine"
+
+        with mock.patch("paddleocr.PaddleOCR", side_effect=fake):
+            engine._build("ch")  # 成功
+            engine._build("korean")  # 回退
+
+        self.assertEqual(engine.profile_effective, "quality")
+        self.assertEqual(engine.degraded_langs, ["korean"])
+
+    def test_quality_never_reports_degraded(self) -> None:
+        """quality 本来就是回退目标，不该自报降级。"""
+        engine = self._engine("quality", fail_mobile=False)
+        self.assertEqual(engine.profile_effective, "quality")
+        self.assertEqual(engine.degraded_langs, [])
+
+    def test_unloaded_engine_reports_configured(self) -> None:
+        """模型还没加载时无从得知，先按配置报——但 degraded_langs 为空
+        只代表"还没开始加载"，不代表已确认生效。"""
+        engine = OcrEngine(device="cpu", profile="fast")
+        self.assertEqual(engine.profile_effective, "fast")
+        self.assertEqual(engine.degraded_langs, [])
+
+
 class PipelineProfileWiringTest(unittest.TestCase):
     """配置项要能从 PipelineConfig 一路传到 OcrEngine。"""
 

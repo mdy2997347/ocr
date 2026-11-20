@@ -440,6 +440,27 @@ class HealthzContractTest(unittest.TestCase):
 
         payload = self._healthz(FakeTranslator({"登录": "Login"}), ocr=FastOcr())
         self.assertEqual(payload["ocr_profile"], "fast")
+        # 真的生效了就不能自报降级，否则这个字段会变成噪声
+        self.assertNotIn("ocr_fallback", payload)
+        self.assertNotIn("ocr_profile_effective", payload)
+
+    def test_reports_ocr_fallback_when_fast_model_unavailable(self) -> None:
+        """配置 fast 但实际回退 quality 时必须报出来。
+
+        线上现状：mobile_det 下载不下来，代码静默回退 quality，而 healthz
+        只报配置值，于是"说 fast、耗时却和 quality 一样"，排查方向被带偏。
+        """
+
+        class FallbackOcr(FakeOcr):
+            profile = "fast"
+            profile_effective = "quality"
+            degraded_langs = ["korean"]
+
+        payload = self._healthz(FakeTranslator({"登录": "Login"}), ocr=FallbackOcr())
+        self.assertEqual(payload["ocr_profile"], "fast")
+        self.assertEqual(payload["ocr_profile_effective"], "quality")
+        self.assertIs(payload["ocr_fallback"], True)
+        self.assertEqual(payload["ocr_degraded_langs"], ["korean"])
 
     def test_translator_without_breaker_still_reports_kind(self) -> None:
         """cloud 通道没有熔断器，不能因此让整个 healthz 崩掉。"""

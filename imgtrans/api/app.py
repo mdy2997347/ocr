@@ -256,6 +256,15 @@ def create_app(
         ocr_profile = getattr(pipeline, "ocr_profile", None)
         if ocr_profile:
             payload["ocr_profile"] = ocr_profile
+        # 实际档位与配置分开报。fast 的检测模型要额外下载，失败会静默回退，
+        # 只报配置值就会出现"healthz 说 fast、耗时却是 quality"的矛盾读数。
+        effective = getattr(pipeline, "ocr_profile_effective", None)
+        if effective and effective != ocr_profile:
+            payload["ocr_profile_effective"] = effective
+            payload["ocr_fallback"] = True
+            degraded = getattr(pipeline, "ocr_degraded_langs", None)
+            if degraded:
+                payload["ocr_degraded_langs"] = list(degraded)
 
         # 翻译通道状态。2026-11 线上踩过：Google 免费接口对机房 IP 返回 429，
         # 熔断器打开后所有请求直接返回原文，接口照样 200 + 原图，
