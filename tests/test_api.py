@@ -39,6 +39,11 @@ from imgtrans.types import Polygon, TextBlock
 class FakeOcr:
     """固定返回一个文字块的假 OCR。"""
 
+    #: 与真实 :class:`~imgtrans.ocr.engine.OcrEngine` 对齐：``/healthz``
+    #: 会读这两个属性，缺了会让探活响应少字段（getattr 静默取默认）。
+    device = "cpu"
+    profile = "quality"
+
     def __init__(self, text: str = "登录") -> None:
         self._text = text
         self.calls: list[str] = []
@@ -385,11 +390,11 @@ class HealthzContractTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         os.environ.pop("IMGTRANS_API_KEY", None)
 
-    def _healthz(self, translator) -> dict:
+    def _healthz(self, translator, ocr=None) -> dict:
         from imgtrans.api.app import create_app
         from imgtrans.pipeline import ImageTranslatePipeline
 
-        pipeline = ImageTranslatePipeline(translator, ocr=FakeOcr())
+        pipeline = ImageTranslatePipeline(translator, ocr=ocr or FakeOcr())
         client = TestClient(create_app(pipeline))
         resp = client.get("/healthz")
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -404,6 +409,8 @@ class HealthzContractTest(unittest.TestCase):
 
         payload = self._healthz(HealthyTranslator({"登录": "Login"}))
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["device"], "cpu")
+        self.assertEqual(payload["ocr_profile"], "quality")
         self.assertEqual(payload["translator"], "web")
         self.assertIs(payload["translator_breaker_open"], False)
         self.assertEqual(payload["translator_trips"], 0)
@@ -420,6 +427,19 @@ class HealthzContractTest(unittest.TestCase):
         self.assertIs(payload["translator_breaker_open"], True)
         self.assertEqual(payload["translator_trips"], 3)
         self.assertIn("429", payload["translator_last_error"])
+
+    def test_reports_fast_ocr_profile(self) -> None:
+        """档位必须能从探活接口看出来。
+
+        ``fast`` 会让紧邻两行有时被并成一段，客户反馈"排版变了"时，
+        第一个要排除的就是线上是不是被切到了 fast。
+        """
+
+        class FastOcr(FakeOcr):
+            profile = "fast"
+
+        payload = self._healthz(FakeTranslator({"登录": "Login"}), ocr=FastOcr())
+        self.assertEqual(payload["ocr_profile"], "fast")
 
     def test_translator_without_breaker_still_reports_kind(self) -> None:
         """cloud 通道没有熔断器，不能因此让整个 healthz 崩掉。"""

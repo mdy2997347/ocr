@@ -251,6 +251,12 @@ def create_app(
         if device:
             payload["device"] = device
 
+        # OCR 档位：``fast`` 会把检测模型换成 mobile（CPU 上快一倍）。
+        # 排查"这张图怎么比昨天慢/漏字"时，先确认线上到底是哪一档。
+        ocr_profile = getattr(pipeline, "ocr_profile", None)
+        if ocr_profile:
+            payload["ocr_profile"] = ocr_profile
+
         # 翻译通道状态。2026-11 线上踩过：Google 免费接口对机房 IP 返回 429，
         # 熔断器打开后所有请求直接返回原文，接口照样 200 + 原图，
         # 表现是"图片还是中文"却没有任何报错。把熔断状态放进探活接口后，

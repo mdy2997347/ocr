@@ -143,6 +143,37 @@ def normalize_ocr_output(raw_result: Any) -> list[tuple[Polygon, str, float]]:
     return out
 
 
+#: OCR 速度档位 -> 追加到 ``PaddleOCR(...)`` 的构造参数。
+#:
+#: 实测基线（790×1235 中文商品图，paddle 3.3.1 / paddleocr 3.7.0，CPU）：
+#:
+#: ======== ======== ======== ========
+#: 档位     检测     识别     合计
+#: ======== ======== ======== ========
+#: quality  11.9s    3.1s     15.0s
+#: fast      4.3s    3.1s      7.5s
+#: ======== ======== ======== ========
+#:
+#: **瓶颈在检测，不在识别。** PP-OCRv6 只发布 medium 一档，而且检测模型
+#: 比识别模型重得多（6.7 倍）。所以 ``fast`` 只换检测模型、识别仍用默认档——
+#: 识别精度**一点没降**，省下的全是从检测里抠出来的。
+#:
+#: 6 张真实图逐块比对（换前 vs 换后）：中文正文持平或更好，典型如
+#: ``霍尼书小的PTM7950是790余列中的高等热柏变材`` -> ``霍尼韦尔的PTM7950是
+#: 7900系列中的高导热相变材科``（旧档把商标名整个认错，新档全对）。
+#: 已知代价：紧挨着的两行可能被检成一个框（进而并成一段）、照片里的
+#: 英文小字召回略降（``Compound Softens`` -> ``und Soften``）。
+#:
+#: 因此默认仍是 ``quality``：这是有取舍的开关，不该替使用者做决定。
+OCR_PROFILES: dict[str, dict[str, Any]] = {
+    "quality": {},
+    "fast": {"text_detection_model_name": "PP-OCRv5_mobile_det"},
+}
+
+#: 默认档位。详见 :data:`OCR_PROFILES`。
+DEFAULT_OCR_PROFILE = "quality"
+
+
 class OcrEngine:
     """线程安全的 PaddleOCR 单例封装。
 
@@ -158,6 +189,8 @@ class OcrEngine:
         use_doc_orientation_classify: bool = False,
         device: str | None = None,
         enable_mkldnn: bool = False,
+        profile: str = DEFAULT_OCR_PROFILE,
+        det_limit_side_len: int | None = None,
     ) -> None:
         """
         Args:
@@ -178,11 +211,19 @@ class OcrEngine:
                 关掉后 CPU 推理正常（640x400 图 5.3s，含首次预热）。
                 若将来 paddle 修好了可显式传 True 提速。GPU 上该项无意义，
                 会被强制关掉并告警。
+            profile: 速度档位，见 :data:`OCR_PROFILES`。``quality``（默认）
+                识别与检测都用 PP-OCRv6 medium；``fast`` 只把检测换成
+                PP-OCRv5 mobile，CPU 上实测 15.0s -> 7.5s，识别精度不变。
+                档位名非法时**在构造时就抛**，不留到第一个请求才炸。
+            det_limit_side_len: 检测阶段的长边上限（像素），``None`` 用
+                PaddleOCR 默认（736 / min，短边不足会放大）。调小可再快
+                约 15%，但密集小字的召回会下降——属于细调项，默认不碰。
 
         Raises:
             DeviceError: 设备取值非法，或配了 gpu 但当前 paddle 用不了卡。
                 **在构造时就抛**，而不是等第一个请求——配置错误不该表现成
                 "第一次调用很慢"。
+            OcrError: ``profile`` 不在 :data:`OCR_PROFILES` 里。
         """
         self._use_textline_orientation = use_textline_orientation
         self._use_doc_unwarping = use_doc_unwarping
@@ -194,8 +235,28 @@ class OcrEngine:
             )
             enable_mkldnn = False
         self._enable_mkldnn = enable_mkldnn
+
+        key = (profile or DEFAULT_OCR_PROFILE).strip().lower()
+        if key not in OCR_PROFILES:
+            raise OcrError(
+                f"未知的 OCR 档位 {profile!r}；可选：{', '.join(sorted(OCR_PROFILES))}"
+            )
+        self._profile = key
+        #: 深拷贝一份：调用方改 OCR_PROFILES 不该影响已建好的实例。
+        self._profile_kwargs: dict[str, Any] = dict(OCR_PROFILES[key])
+        self._det_limit_side_len = det_limit_side_len
+
         self._engines: dict[str, Any] = {}
         self._lock = threading.Lock()
+
+    @property
+    def profile(self) -> str:
+        """生效的速度档位，供启动日志与 ``/healthz`` 展示。
+
+        线上排查"这张图怎么比昨天慢"时，第一个要确认的就是它——档位是
+        配置项，光看响应体看不出来。
+        """
+        return self._profile
 
     @property
     def device(self) -> str:
@@ -224,6 +285,9 @@ class OcrEngine:
             # 与"默认 cpu"的约定不一致。
             "device": self._device,
         }
+        kwargs.update(self._profile_kwargs)
+        if self._det_limit_side_len:
+            kwargs["text_det_limit_side_len"] = int(self._det_limit_side_len)
 
         try:
             return PaddleOCR(**kwargs)
@@ -237,6 +301,22 @@ class OcrEngine:
                 "use_gpu": self._device != "cpu",
             }
             return PaddleOCR(**fallback)
+        except Exception as exc:  # noqa: BLE001 - 见下
+            # fast 档的检测模型要额外下载，也可能与当前 paddle 版本不匹配。
+            # 这种时候退化成 quality（慢但能跑）远好过整站不可用：
+            # 档位是"想更快"的优化项，不该成为"服务起不来"的原因。
+            if not self._profile_kwargs:
+                raise OcrError(f"PaddleOCR 初始化失败：{exc}") from exc
+            logger.warning(
+                "OCR 档位 %s 的检测模型加载失败(%s)，本语言回退到 quality",
+                self._profile,
+                exc,
+            )
+            degraded = {k: v for k, v in kwargs.items() if k not in self._profile_kwargs}
+            try:
+                return PaddleOCR(**degraded)
+            except Exception as inner:  # noqa: BLE001 - 回退也失败，只能报错
+                raise OcrError(f"PaddleOCR 初始化失败（含回退 quality）：{inner}") from inner
 
     def get(self, lang: str) -> Any:
         """取（或惰性构造）指定语言的引擎实例。"""

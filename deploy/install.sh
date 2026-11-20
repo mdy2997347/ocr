@@ -875,6 +875,11 @@ IMGTRANS_PORT=${EFFECTIVE_PORT}
 # 推理设备：cpu / gpu / gpu:0 / auto（有卡用卡、无卡回落 cpu）
 IMGTRANS_DEVICE=${device}
 
+# OCR 速度档位：quality（默认，最准）/ fast（CPU 上实测快一倍）
+# 瓶颈在检测阶段，fast 只换检测模型，识别模型不变，识别精度不降。
+# 代价：紧邻的两行可能被并成一个框、照片内英文小字召回略降。
+IMGTRANS_OCR_PROFILE=quality
+
 # 模型缓存目录（相对项目根，约 140MB）。指向项目内 = 删目录即彻底清除，
 # 且不会与同机其它 paddle 项目互相污染。
 IMGTRANS_MODEL_DIR=.models

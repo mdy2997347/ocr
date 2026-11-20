@@ -124,6 +124,14 @@ class PipelineConfig:
     #: 只认环境变量，是为了让库调用方（测试、批处理脚本）能显式钉死设备，
     #: 不被 shell 里残留的变量影响。
     device: str | None = None
+    #: OCR 速度档位：``quality``（默认）/ ``fast``。见 ``ocr.engine.OCR_PROFILES``。
+    #:
+    #: ``fast`` 只把检测模型换成 PP-OCRv5 mobile，识别仍用 PP-OCRv6 medium，
+    #: CPU 上实测 15.0s -> 7.5s。档位名写错会在建 pipeline 时就抛。
+    ocr_profile: str = "quality"
+    #: 检测阶段长边上限（像素）。``None`` 用 PaddleOCR 默认。
+    #: 调小约再快 15%，代价是密集小字召回下降——细调项，默认不碰。
+    ocr_det_side_len: int | None = None
 
 
 class ImageTranslatePipeline:
@@ -140,7 +148,11 @@ class ImageTranslatePipeline:
         self._translator = translator
         self._config = config or PipelineConfig()
         # 先有 config 才能知道设备：配置里的 device 优先，None 才落到环境变量。
-        self._ocr = ocr or OcrEngine(device=self._config.device)
+        self._ocr = ocr or OcrEngine(
+            device=self._config.device,
+            profile=self._config.ocr_profile,
+            det_limit_side_len=self._config.ocr_det_side_len,
+        )
         # 字体目录：配置显式给了就用配置，否则读 IMGTRANS_FONT_DIRS。
         # 容器里字体通常在 /opt/fonts 这类自定义路径，系统目录扫不到。
         self._font_book = font_book or FontBook(
@@ -155,6 +167,11 @@ class ImageTranslatePipeline:
     def device(self) -> str:
         """实际生效的推理设备（已归一化），用于启动日志与健康检查。"""
         return self._ocr.device
+
+    @property
+    def ocr_profile(self) -> str:
+        """生效的 OCR 速度档位（``quality`` / ``fast``），供 ``/healthz`` 展示。"""
+        return getattr(self._ocr, "profile", "unknown")
 
     @property
     def translator(self) -> BaseTranslator:

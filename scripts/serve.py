@@ -82,6 +82,21 @@ def main() -> int:
         help="推理设备：cpu（默认）/ gpu / gpu:0 / auto（有卡就用卡，无卡回落 cpu）",
     )
     parser.add_argument("--dev", action="store_true", help="开发模式：不校验 API Key")
+    parser.add_argument(
+        "--ocr-profile",
+        default=os.environ.get("IMGTRANS_OCR_PROFILE") or "quality",
+        help=(
+            "OCR 速度档位（默认取 IMGTRANS_OCR_PROFILE）："
+            "quality=检测与识别都用 PP-OCRv6 medium（默认，最准）；"
+            "fast=检测换 PP-OCRv5 mobile，CPU 上约快一倍，识别精度不变"
+        ),
+    )
+    parser.add_argument(
+        "--ocr-det-side-len",
+        type=int,
+        default=int(os.environ.get("IMGTRANS_OCR_DET_SIDE_LEN") or 0) or None,
+        help="检测阶段长边上限（像素）。默认用 PaddleOCR 的 736；调小更快但小字会漏",
+    )
     parser.add_argument("--workers", type=int, default=1, help="worker 进程数（每个都会加载一份模型）")
     parser.add_argument("--no-warmup", action="store_true", help="跳过模型预热")
     parser.add_argument("--output-format", default="png", choices=["png", "jpeg", "webp"])
@@ -140,6 +155,19 @@ def main() -> int:
         print(f"拒绝启动：{exc}", file=sys.stderr)
         return 2
 
+    # 档位名在这里就校验：写在 .env 里的拼写错误（qualityy / FAST 之外的
+    # 乱写）应该在加载模型之前退出，而不是等服务起来、首个请求才炸。
+    from imgtrans.ocr.engine import OCR_PROFILES
+
+    ocr_profile = (args.ocr_profile or "quality").strip().lower()
+    if ocr_profile not in OCR_PROFILES:
+        print(
+            f"拒绝启动：未知的 OCR 档位 {args.ocr_profile!r}；"
+            f"可选：{', '.join(sorted(OCR_PROFILES))}",
+            file=sys.stderr,
+        )
+        return 2
+
     if getattr(translator, "kind", "") == "cloud" and not (
         google_key or google_credentials
     ):
@@ -151,10 +179,11 @@ def main() -> int:
     # 设备确认之后才报监听地址：日志顺序就是启动顺序，
     # 先喊"监听中"再因为设备配错退出，会让人以为服务起过又挂了。
     logging.info(
-        "监听 %s:%s，翻译通道 %s，代理 %s，鉴权 %s",
+        "监听 %s:%s，翻译通道 %s，OCR 档位 %s，代理 %s，鉴权 %s",
         args.host,
         args.port,
         getattr(translator, "kind", args.translator),
+        ocr_profile,
         args.proxy or "无",
         "关闭（--dev）" if args.dev else "开启",
     )
@@ -162,7 +191,12 @@ def main() -> int:
     def factory():
         pipeline = ImageTranslatePipeline(
             translator,
-            config=PipelineConfig(output_format=args.output_format, device=device),
+            config=PipelineConfig(
+                output_format=args.output_format,
+                device=device,
+                ocr_profile=ocr_profile,
+                ocr_det_side_len=args.ocr_det_side_len,
+            ),
         )
         # 预热交给 app 的 startup 钩子统一做：两处都调的话 --no-warmup
         # 只跳过了这里那次，startup 里还会照热一遍（真踩过）。

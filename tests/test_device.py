@@ -264,13 +264,21 @@ class OcrEngineDeviceTest(unittest.TestCase):
 
 
 class _StubOcr:
-    """假 OCR：记录收到的 device，验证配置层到引擎层的透传。"""
+    """假 OCR：记录收到的 device/profile，验证配置层到引擎层的透传。"""
 
     last_device: object = "unset"
+    last_profile: object = "unset"
 
-    def __init__(self, device: str | None = None) -> None:
+    def __init__(
+        self,
+        device: str | None = None,
+        profile: str = "quality",
+        det_limit_side_len: int | None = None,
+    ) -> None:
         type(self).last_device = device
+        type(self).last_profile = profile
         self.device = device or "cpu"
+        self.profile = profile
 
 
 class PipelineDeviceTest(unittest.TestCase):
@@ -281,6 +289,7 @@ class PipelineDeviceTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         _StubOcr.last_device = "unset"
+        _StubOcr.last_profile = "unset"
 
     def _restore_env(self) -> None:
         os.environ.pop(ENV_VAR, None)
@@ -308,6 +317,18 @@ class PipelineDeviceTest(unittest.TestCase):
         )
         # 不硬塞 cpu：让 OcrEngine 去读 IMGTRANS_DEVICE，否则 .env 配置失效
         self.assertIsNone(_StubOcr.last_device)
+
+    def test_config_ocr_profile_reaches_engine(self) -> None:
+        """档位也要透传，否则 serve.py 传了 config 却对引擎无效。"""
+        from imgtrans.pipeline import ImageTranslatePipeline, PipelineConfig
+
+        pipeline = ImageTranslatePipeline(
+            object(),
+            font_book=types.SimpleNamespace(),
+            config=PipelineConfig(ocr_profile="fast"),
+        )
+        self.assertEqual(_StubOcr.last_profile, "fast")
+        self.assertEqual(pipeline.ocr_profile, "fast")
 
 
 if __name__ == "__main__":
