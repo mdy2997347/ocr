@@ -6,7 +6,8 @@
   单次请求可携带多个 ``q`` 参数，响应是与 ``q`` 顺序一一对应的 JSON 数组。
   批量翻译时 ``tk`` 用 **所有文本拼接串** 计算（PHP ``implode("", $text)``）。
 * **free**（降级通道，PHP ``free()``）：``POST /translate_a/single``，
-  伪装 Android 客户端；一次只发一条 ``q``，返回 ``sentences[].trans``。
+  伪装 Android 客户端；**整批文本用 ``\\n`` 拼成一个 ``q``，一次请求发完**，
+  回包按 ``sentences[].orig`` 对齐回各段（与 PHP 一致）。
 
 与 PHP 版的行为差异（均为有意为之，已与主理人确认）
 --------------------------------------------------
@@ -14,10 +15,7 @@
    ``Hello WORLD`` 变成 ``Hello world``，摧毁德语名词大写、全大写标题与
    品牌名，对 CJK 目标语言更是无意义。本实现只做 ``html.unescape()``。
 2. 不移植 ``cn()`` 通道：``translate.google.cn`` 已于 2022 年停止服务。
-3. 不移植 ``getTransTexts()`` 的段落模糊对齐逻辑：它靠 ``orig`` 反查来
-   把多段译文重新对齐到原文，一旦错位就会把译文画到图片的错误位置；
-   本模块的单条模式直接按 ``sentences`` 顺序拼接 ``trans``。
-4. ``multi_ip``（多网卡出口 IP 随机轮换）不移植。**注意：不要以为
+3. ``multi_ip``（多网卡出口 IP 随机轮换）不移植。**注意：不要以为
    ``local_address`` 参数能等价替代它** —— httpx 无法绑定源地址，本模块
    传 ``local_address`` 会直接抛 :class:`NotImplementedError`（见
    :data:`LOCAL_ADDRESS_UNSUPPORTED`）。多出口需求请走代理池或系统策略路由，
@@ -35,6 +33,7 @@ import inspect
 import json
 import logging
 import random
+import re
 import threading
 import time
 import uuid
@@ -85,6 +84,16 @@ Transport = Callable[
     [str, str, "dict[str, Any] | None", "dict[str, str] | None", "bytes | None", float],
     "tuple[int, str]",
 ]
+
+
+def _normalize_for_match(text: str) -> str:
+    """对齐 ``sentences[].orig`` 与入参文本时用的归一化（PHP 同款）。
+
+    PHP ``getTransTexts()`` 的写法是：去空白 → 合并连续逗号 → 去不换行空格
+    → 去句点，再互相 ``stristr``。Google 回包里的 ``orig`` 会在标点、空格、
+    换行上与入参有细微差异，不归一化就永远对不上。
+    """
+    return re.sub(r",+", ",", re.sub(r"\s+", "", text)).replace("\u00a0", "").replace(".", "")
 
 
 class _TokenBucket:
@@ -521,6 +530,13 @@ class GoogleWebTranslator:
         )
         #: 最近一次 api 通道的 HTTP 状态码，供"是否值得重试"的判断使用。
         self._last_api_status: int | None = None
+        #: 最近一次 ``translate_batch`` 的整体失败原因；成功后清空。
+        #: ``None`` 表示"这一轮翻译没出故障"——注意与"译不出来"不同：
+        #: 图里没有可译文字时它也是 ``None``。上层据此区分"正常返回原图"
+        #: 和"通道挂了却返回原图"，后者必须报错。
+        self.last_error: str | None = None
+        #: 通道标识，供 ``/healthz`` 展示。
+        self.kind: str = "free" if prefer == "free" else "web"
 
     # ------------------------------------------------------------------ #
     # 公共 API
@@ -549,6 +565,9 @@ class GoogleWebTranslator:
         if not normalized_target:
             raise ValueError("target language is required")
         normalized_source = self._web_lang(source, default="auto") or "auto"
+        # 每次批量翻译开头清空：上一次的失败原因不能留在这一次的结果里，
+        # 否则一张正常的图会被上一次的 429 误判成故障（反之亦然）。
+        self.last_error = None
 
         items = self._normalize_texts(texts)
         if not items:
@@ -713,6 +732,12 @@ class GoogleWebTranslator:
                 source,
                 target,
             )
+            # 记下原因，上层据此把"通道挂了"和"图里没字"区分开。
+            if self.last_error is None:
+                self.last_error = (
+                    f"熔断打开（连续 403/429 达阈值，已累计 {self._breaker.trip_count} 次），"
+                    f"本次未发起请求；出口 IP 可能已被 Google 限流"
+                )
             return list(chunk)
 
         primary, secondary = ("free", "api") if self._prefer == "free" else ("api", "free")
@@ -739,6 +764,12 @@ class GoogleWebTranslator:
             source,
             target,
         )
+        if self.last_error is None:
+            status = f"，api 通道最后 HTTP {self._last_api_status}" if self._last_api_status else ""
+            self.last_error = (
+                f"{primary}/{secondary} 两个通道均失败{status}；"
+                f"429 表示出口 IP 被限流，403 表示被判定为机器人"
+            )
         return list(chunk)
 
     def _try_channel(
@@ -860,27 +891,39 @@ class GoogleWebTranslator:
     # ------------------------------------------------------------------ #
 
     def _free_chunk(self, chunk: list[str], source: str, target: str) -> list[str] | None:
-        """``free`` 通道逐条翻译；全部失败返回 ``None``。"""
-        translated: list[str] = []
-        failures = 0
-        for text in chunk:
-            try:
-                segment = self._translate_free(text, source, target)
-            except TranslationError as exc:
-                logger.warning("free channel error: %s", exc)
-                failures += 1
-                translated.append(text)
-                continue
-            translated.append(segment if segment.strip() else text)
-        if failures == len(chunk):
+        """``free`` 通道：**整批一次请求**（对齐 PHP ``free()``）。
+
+        逐个文本发请求是移植时留下的性能陷阱：PHP 把所有文本用 ``\\n``
+        拼成一个 ``q`` 发一次，回包再按 ``sentences[].orig`` 拆回各行。
+        一张 72 个文本块的图逐条发就是 72 次 HTTP —— 实测立刻吃 429，
+        随后熔断打开、整批返回原文，表现成"图片还是中文"。
+        """
+        if not chunk:
+            return []
+        try:
+            return self._translate_free_batch(chunk, source, target)
+        except TranslationError as exc:
+            logger.warning("free channel error: %s", exc)
             return None
-        return translated
+
+    def _translate_free_batch(
+        self, chunk: list[str], source: str, target: str
+    ) -> list[str]:
+        """一次 POST 翻译整批，返回等长同序列表。"""
+        sentences = self._post_free("\n".join(chunk), source, target)
+        return self._align_free_sentences(chunk, sentences)
 
     def _translate_free(self, text: str, source: str, target: str) -> str:
-        """走 ``/translate_a/single`` 翻译单条文本。"""
+        """单条翻译。仍走整批路径，保证"单条也只有一次请求"。"""
         if not text.strip():
             return text
+        parts = [
+            s["trans"] for s in self._post_free(text, source, target) if isinstance(s.get("trans"), str)
+        ]
+        return "".join(parts).rstrip()
 
+    def _post_free(self, text: str, source: str, target: str) -> list[dict[str, Any]]:
+        """发一次 ``/translate_a/single``，返回 ``sentences`` 里的字典列表。"""
         last_status = 0
         for attempt in range(2):
             query = urlencode(
@@ -914,7 +957,7 @@ class GoogleWebTranslator:
                 data=body.encode("utf-8"),
             )
             if status == 200:
-                return self._parse_free_payload(payload_text)
+                return self._free_sentences(payload_text)
 
             last_status = status
             if status == FREE_RETRY_STATUS and attempt == 0:
@@ -926,11 +969,8 @@ class GoogleWebTranslator:
         raise TranslationError(f"free channel http {last_status}")
 
     @staticmethod
-    def _parse_free_payload(payload_text: str) -> str:
-        """拼接 ``sentences[].trans``。
-
-        不移植 PHP ``getTransTexts()`` 的段落模糊对齐（见模块 docstring 差异 3）。
-        """
+    def _free_sentences(payload_text: str) -> list[dict[str, Any]]:
+        """解析 ``{"sentences": [...]}``，只留字典项。"""
         try:
             payload = json.loads(payload_text)
         except (TypeError, ValueError) as exc:
@@ -943,13 +983,54 @@ class GoogleWebTranslator:
         if not isinstance(sentences, list):
             raise TranslationError("free channel response has no sentences")
 
-        parts: list[str] = []
+        return [s for s in sentences if isinstance(s, dict)]
+
+    @classmethod
+    def _align_free_sentences(
+        cls, texts: list[str], sentences: list[dict[str, Any]]
+    ) -> list[str]:
+        """把回包的句子对齐回入参文本（PHP ``getTransTexts()`` 的移植）。
+
+        为什么不能按下标硬取：Google 会把 ``a\\nb`` 拆成几句是不确定的 ——
+        可能 1:1，也可能两行并成一句或一行拆成两句。对齐不上的位置保留
+        原文，宁可少翻一段，也不能把 A 段的译文画到 B 段上（那比不翻更糟）。
+        """
+        if len(texts) == 1:
+            parts = [s["trans"] for s in sentences if isinstance(s.get("trans"), str)]
+            return ["".join(parts).rstrip()]
+
+        # 快速路径：句数与行数相等，说明 Google 按行返回，直接一一对应。
+        # 注意每句译文尾部普遍带 "\n"（实测 40/40 都有），不去掉会把换行
+        # 带进回填，行高与折行全乱——PHP 那边是 ``rtrim($trans, "\n ")``。
+        if len(sentences) == len(texts):
+            out: list[str] = []
+            for i, sentence in enumerate(sentences):
+                trans = sentence.get("trans")
+                cleaned = trans.rstrip("\n ") if isinstance(trans, str) else ""
+                out.append(cleaned if cleaned.strip() else texts[i])
+            return out
+
+        # 慢速路径：按 orig 做前缀对齐（与 PHP 同款归一化后比较）
+        result: list[str | None] = [None] * len(texts)
+        index = 0
         for sentence in sentences:
-            if isinstance(sentence, dict):
-                segment = sentence.get("trans")
-                if isinstance(segment, str):
-                    parts.append(segment)
-        return "".join(parts).rstrip()
+            if index >= len(texts):
+                break
+            orig = sentence.get("orig")
+            trans = sentence.get("trans")
+            if not isinstance(orig, str) or not isinstance(trans, str):
+                continue
+            expect = _normalize_for_match(texts[index])
+            got = _normalize_for_match(orig)
+            if not got or not expect:
+                continue
+            if got in expect:
+                segment = trans.rstrip("\n ")
+                result[index] = f"{result[index]} {segment}" if result[index] else segment
+                # 期望的那一行以这句原文结尾 → 这行翻完了，换下一行
+                if expect.endswith(got):
+                    index += 1
+        return [r if r else texts[i] for i, r in enumerate(result)]
 
     def _refresh_free_cookie(self) -> None:
         """``free`` 通道 503 后的"刷新 cookie"动作。

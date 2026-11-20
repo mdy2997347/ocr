@@ -127,9 +127,16 @@ class FakeTransport:
 
 
 def free_ok(call: Call) -> tuple[int, str]:
-    """把请求体里的 ``q`` 包一层，模拟 free 通道成功响应。"""
+    """模拟 free 通道成功响应。
+
+    free 通道是**整批一次请求**（对齐 PHP：多行用 ``\\n`` 拼成一个 ``q``），
+    所以假响应也必须按行拆开返回，否则测的就不是真实形状了。
+    """
     text = call.form.get("q", [""])[0]
-    return 200, json.dumps({"sentences": [{"trans": f"译:{text}", "orig": text}]})
+    lines = text.split("\n")
+    return 200, json.dumps(
+        {"sentences": [{"trans": f"译:{line}", "orig": line} for line in lines]}
+    )
 
 
 def api_ok(call: Call) -> tuple[int, str]:
@@ -445,6 +452,37 @@ class ChannelFallbackTest(unittest.TestCase):
         translator = make_translator(transport)
         translator.MAX_ATTEMPTS = 1
         self.assertEqual(translator.translate_batch(["abc"], None, "en"), ["abc"])
+
+    def test_free_channel_batches_whole_chunk_in_one_request(self) -> None:
+        """整批只发一次请求。
+
+        这是 PHP ``free()`` 的行为（``implode("\\n", $text)`` 后发一次），
+        也是当年线上 429 的根因：逐条发送时 72 个文本块 = 72 次 HTTP，
+        必然触发限流，随后熔断返回原图。
+        """
+        transport = router(api=lambda call: (403, ""), free=free_ok)
+        translator = make_translator(transport, max_items_per_request=50)
+
+        result = translator.translate_batch(["a", "b", "c"], None, "en")
+
+        self.assertEqual(result, ["译:a", "译:b", "译:c"])
+        self.assertEqual(len(transport.free_calls()), 1, "3 条文本必须合并成 1 次请求")
+        self.assertEqual(transport.free_calls()[0].form["q"], ["a\nb\nc"])
+
+    def test_free_channel_alignment_failure_keeps_original(self) -> None:
+        """回包与入参对不上时保留原文，绝不按位置硬贴。"""
+
+        def free(call: Call) -> tuple[int, str]:
+            # 两行文本只回来一句，且 orig 与任何一行都不匹配
+            return 200, json.dumps({"sentences": [{"trans": "???", "orig": "毫不相干"}]})
+
+        transport = router(api=lambda call: (403, ""), free=free)
+        translator = make_translator(transport)
+
+        self.assertEqual(
+            translator.translate_batch(["床品四件套", "面料：100%棉"], None, "en"),
+            ["床品四件套", "面料：100%棉"],
+        )
 
     def test_all_channels_fail_returns_originals(self) -> None:
         """全部失败 → 原文占位、长度不变、顺序不变。"""
