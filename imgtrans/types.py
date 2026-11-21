@@ -55,6 +55,12 @@ class TextBlock:
     #: 该块由多少行合并而来（1 表示单行）。
     line_count: int = 1
 
+    #: :attr:`box` 的缓存。``polygon`` 是不可变的四点元组，包围盒因此唯一确定；
+    #: 一次整图流程里 ``box`` 会被取上万次（分组、遮罩、回填都在取），
+    #: 每次都重算一遍 min/max 纯属浪费——480 块的密表格上单是分组那一步
+    #: 就有 7.5 万次调用，占掉这一步九成的时间。
+    _box: Box | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if self.index < 0:
             raise ValueError(f"index must be >= 0, got {self.index}")
@@ -64,14 +70,19 @@ class TextBlock:
     @property
     def box(self) -> Box:
         """轴对齐包围盒（向外取整，保证不裁掉抗锯齿边缘）。"""
+        cached = self._box
+        if cached is not None:
+            return cached
         xs = [p[0] for p in self.polygon]
         ys = [p[1] for p in self.polygon]
-        return (
+        box = (
             int(min(xs) // 1),
             int(min(ys) // 1),
             int(-(-max(xs) // 1)),
             int(-(-max(ys) // 1)),
         )
+        self._box = box
+        return box
 
     @property
     def width(self) -> float:

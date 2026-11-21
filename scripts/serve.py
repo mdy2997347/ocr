@@ -101,6 +101,12 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=1, help="worker 进程数（每个都会加载一份模型）")
     parser.add_argument("--no-warmup", action="store_true", help="跳过模型预热")
     parser.add_argument("--output-format", default="png", choices=["png", "jpeg", "webp"])
+    parser.add_argument(
+        "--row-join-gap",
+        type=float,
+        default=0.45,
+        help="行内碎片拼接的水平间隙上限（相对行高）。0 关闭；参数表密集的图可调到 0.2",
+    )
     args = parser.parse_args()
 
     if args.dev:
@@ -229,6 +235,7 @@ def main() -> int:
                 device=device,
                 ocr_profile=ocr_profile,
                 ocr_det_side_len=args.ocr_det_side_len,
+                row_join_gap_ratio=args.row_join_gap,
             ),
         )
         # 预热交给 app 的 startup 钩子统一做：两处都调的话 --no-warmup

@@ -339,5 +339,58 @@ class EncodeDecodeTest(unittest.TestCase):
         self.assertEqual(decoded.shape[1], 10)
 
 
+class RowJoinWiringTest(unittest.TestCase):
+    """行内拼接必须真的接在链路上：碎片要在**送翻译之前**拼成一条行。
+
+    只测 ``join_row_fragments`` 不够——函数写得对但没被调用，线上照旧是碎片。
+    这里断言翻译器收到的请求体本身，是唯一能证明接线正确的地方。
+    """
+
+    @staticmethod
+    def _png() -> bytes:
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = Image.new("RGB", (1000, 260), (250, 250, 250))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_fragments_reach_translator_as_one_line(self) -> None:
+        blocks = [
+            _block(0, "说明：系统价格默认304材质，", 10, 20, w=550, h=50),
+            _block(1, "如需316材质请", 575, 20, w=385, h=50),
+        ]
+        translator = RecordingTranslator()
+        pipeline = ImageTranslatePipeline(
+            translator, ocr=FakeOcr(blocks), config=PipelineConfig()
+        )
+
+        pipeline.translate_bytes(self._png(), "en")
+
+        self.assertEqual(
+            translator.calls,
+            [["说明：系统价格默认304材质，如需316材质请"]],
+            "碎片应拼成一条行后再送翻译",
+        )
+
+    def test_can_be_disabled_by_config(self) -> None:
+        blocks = [
+            _block(0, "说明：系统价格默认304材质，", 10, 20, w=550, h=50),
+            _block(1, "如需316材质请", 575, 20, w=385, h=50),
+        ]
+        translator = RecordingTranslator()
+        pipeline = ImageTranslatePipeline(
+            translator,
+            ocr=FakeOcr(blocks),
+            config=PipelineConfig(row_join_gap_ratio=0, merge_paragraphs=False),
+        )
+
+        pipeline.translate_bytes(self._png(), "en")
+
+        self.assertEqual(translator.calls[0], ["说明：系统价格默认304材质，", "如需316材质请"])
+
+
 if __name__ == "__main__":
     unittest.main()

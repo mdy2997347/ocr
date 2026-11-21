@@ -34,7 +34,7 @@ from .downloader import fetch_image
 from .inpaint.erase import erase_text
 from .inpaint.mask import BoxAnalysis, analyze_box
 from .ocr.engine import OcrEngine, resolve_ocr_lang
-from .ocr.group import group_blocks
+from .ocr.group import group_blocks, join_row_fragments
 from .render.fonts import FontBook, font_dirs_from_env
 from .render.style import analyze_style
 from .render.text import render_blocks
@@ -110,6 +110,12 @@ class PipelineConfig:
     #: 是否把 OCR 的行级块聚合成段落。默认开启：按行翻译会让一段话在
     #: 折行处被切断（语义碎片化），且同段内字号忽大忽小。详见 ocr.group。
     merge_paragraphs: bool = True
+    #: 行内碎片拼接的水平间隙上限（相对行高）。``0`` 关闭。
+    #:
+    #: 检测器会把一条长行切成左右两块（大字号窄条幅上尤其常见），碎片
+    #: 各自成段后字号不一、回填互相压字。详见 :func:`imgtrans.ocr.group.join_row_fragments`。
+    #: 排满参数表的图可以把这里调小（如 ``0.2``）或直接设 ``0``。
+    row_join_gap_ratio: float = 0.45
     #: 是否回填译文（False 时只返回"擦干净的图 + 块信息"，对应百度 paste=3）
     render: bool = True
     #: 是否擦除原文（False 时返回原图，仅做 OCR + 翻译，用于调试）
@@ -316,10 +322,18 @@ class ImageTranslatePipeline:
         # --- 段落聚合（行级 -> 段落级） ---
         # 放在翻译之前：翻译的最小单位应该是"一段话"而不是"一行"，
         # 否则折行处的主谓宾被切断，译文必然失真。
-        if blocks and self._config.merge_paragraphs:
+        #
+        # 分两步，且第一步**不受 merge_paragraphs 影响**：行内拼接是在还原
+        # "检测器本来该给出的一行"，不是段落决策。关掉段落聚合仍应拼回碎片，
+        # 否则一张图关掉段落聚合就退回"碎片各自定字号"的老问题。
+        if blocks:
             t0 = time.perf_counter()
             before = len(blocks)
-            blocks = group_blocks(blocks)
+            blocks = join_row_fragments(
+                blocks, gap_ratio=self._config.row_join_gap_ratio
+            )
+            if self._config.merge_paragraphs:
+                blocks = group_blocks(blocks)
             timings["group"] = (time.perf_counter() - t0) * 1000
             if len(blocks) < before:
                 logger.info("段落聚合: %d 行 -> %d 段", before, len(blocks))
