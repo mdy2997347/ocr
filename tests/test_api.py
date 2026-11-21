@@ -374,6 +374,64 @@ class ApiContractTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 422)
 
 
+class TieredFakeTranslator:
+    """会声明能力边界的假通道（模拟百度标准版：11 个语种要尊享版）。"""
+
+    kind = "fake-tiered"
+    PREMIUM_ONLY = frozenset({"bn", "he", "hi", "hr", "id", "ka", "ms", "no", "sl", "tr", "uk"})
+
+    def unsupported_target_reason(self, code: str | None) -> str | None:
+        if code in self.PREMIUM_ONLY:
+            return f"{code} 需企业尊享版"
+        return None
+
+    def translate_batch(self, texts, source, target):
+        return list(texts)
+
+
+@unittest.skipUnless(HAS_DEPS and HAS_FASTAPI, "需要 opencv/pillow/fastapi")
+class LanguageCapabilityApiTest(unittest.TestCase):
+    """通道能力要能从接口看出来，别让人选完才发现翻不了。"""
+
+    def setUp(self) -> None:
+        # 走开发模式：本类只关心语言校验，鉴权另有专门用例。
+        patcher = mock.patch.dict(os.environ, {"IMGTRANS_DEV": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _client(self) -> "TestClient":
+        from imgtrans.api.app import create_app
+        from imgtrans.pipeline import ImageTranslatePipeline
+
+        pipeline = ImageTranslatePipeline(TieredFakeTranslator(), ocr=FakeOcr())
+        return TestClient(create_app(pipeline))
+
+    def test_languages_reflects_channel_capability(self) -> None:
+        """/v1/languages 按通道能力过滤，并给出被排除项及原因。"""
+        payload = self._client().get("/v1/languages").json()
+        self.assertEqual(payload["count"], len(payload["targets"]))
+        self.assertEqual(payload["count"], 35 - len(TieredFakeTranslator.PREMIUM_ONLY))
+        self.assertNotIn("ka", payload["targets"])
+        self.assertIn("en", payload["targets"])
+        self.assertEqual(
+            {item["code"] for item in payload["excluded"]},
+            set(TieredFakeTranslator.PREMIUM_ONLY),
+        )
+        for item in payload["excluded"]:
+            self.assertTrue(item["reason"])
+
+    def test_unsupported_target_is_400_with_reason(self) -> None:
+        """选到翻不了的语言：400 + E_LANG，且话说得清（不是"通道不可用"）。"""
+        resp = self._client().post(
+            "/v1/translate/upload",
+            files={"file": ("a.png", _png_bytes(), "image/png")},
+            data={"target": "ka"},
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertEqual(resp.json()["error"]["code"], "E_LANG")
+        self.assertIn("尊享版", resp.json()["error"]["message"])
+
+
 @unittest.skipUnless(HAS_DEPS and HAS_FASTAPI, "需要 opencv/pillow/fastapi")
 class HealthzContractTest(unittest.TestCase):
     """``/healthz`` 必须把翻译通道状态吐出来。

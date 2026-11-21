@@ -28,6 +28,8 @@ from __future__ import annotations
 __all__ = [
     "AUTO_LIST",
     "BAIDU_LANGS",
+    "BAIDU_STANDARD_CODES",
+    "BAIDU_STANDARD_LANGS",
     "CONVERT_CODES",
     "SUPPORTED_LANGS",
     "is_supported_lang",
@@ -223,6 +225,33 @@ BAIDU_LANGS: dict[str, str] = {
     "uk": "ukr",
     "vi": "vie",
 }
+
+#: 百度**标准版/高级版**能用的语种码（官方"常见语种列表"，共 28 个）。
+#:
+#: 官方原文：*"个人标准版和高级版支持 28 个常见语种，企业尊享版支持全部语种。
+#: 对于非常用语种，仅企业已认证的尊享版用户可调用，未认证的非尊享版用户调用
+#: 将返回 58001 错误。"*
+#:
+#: 这一条是本模块里**唯一**由"账号档位"而非"接口能力"决定的边界，实测过：
+#: 该表之外的 11 个目标语言（``ben``/``heb``/``hi``/``hrv``/``id``/``geo``
+#: /``may``/``nor``/``slv``/``tr``/``ukr``）无论源语言是什么，一律 58001。
+#: 其中土耳其语、印尼语被百度归入"非常用语种"，属于百度口径，不是我们判断错。
+#:
+#: 表内 ``zh``/``cht``/``yue``/``wyw`` 是中文，只作源语言，不计入目标语言可用集。
+BAIDU_STANDARD_CODES: frozenset[str] = frozenset(
+    {
+        "zh", "en", "yue", "wyw", "jp", "kor", "fra", "spa", "th", "ara",
+        "ru", "pt", "de", "it", "el", "nl", "pl", "bul", "est", "dan",
+        "fin", "cs", "rom", "slo", "swe", "hu", "cht", "vie",
+    }
+)
+
+#: 标准版可作**目标**语言的项目码（由 :data:`BAIDU_STANDARD_CODES` 反查得到，
+#: 实测 24 个，与百度接口实测结果完全一致）。
+BAIDU_STANDARD_LANGS: frozenset[str] = frozenset(
+    code for code, baidu_code in BAIDU_LANGS.items()
+    if baidu_code in BAIDU_STANDARD_CODES
+)
 
 #: 只用于**源**语言（或百度的特殊码）的映射。
 #:

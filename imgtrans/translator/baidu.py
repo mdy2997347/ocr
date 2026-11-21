@@ -53,7 +53,12 @@ from urllib.parse import urlencode
 
 from ._http import Transport, _HttpXTransport, _TokenBucket
 from .base import TranslationError
-from .lang_map import to_baidu_lang
+from .lang_map import (
+    BAIDU_STANDARD_CODES,
+    BAIDU_STANDARD_LANGS,
+    normalize_lang,
+    to_baidu_lang,
+)
 
 __all__ = [
     "API_DOMAIN",
@@ -114,7 +119,11 @@ ERROR_HINTS: dict[str, str] = {
     "54004": "账户余额不足：去开放平台充值",
     "54005": "长 query 请求过于频繁：稍后重试或降低批大小",
     "58000": "客户端 IP 非法：开放平台里设了 IP 白名单，把这台机器的出口 IP 加进去",
-    "58001": "译文语言方向不支持",
+    "58001": (
+        "译文语言方向不支持：个人标准版/高级版只认 28 个常见语种，"
+        "非常用语种（tr/id/hi/ka/uk/he/hr/sl/ms/no/bn）要企业尊享版；"
+        "若已开通尊享版，检查 IMGTRANS_BAIDU_PREMIUM 是否为 1"
+    ),
     "58002": "服务当前已关闭：控制台里重新开启通用文本翻译",
     "90107": "认证未通过或未生效：确认服务已开通且审核通过",
 }
@@ -320,6 +329,7 @@ class BaiduTranslator:
         transport: Transport | None = None,
         salt_factory: Callable[[], str] | None = None,
         clock: Callable[[], float] | None = None,
+        premium: bool = False,
     ) -> None:
         """初始化（不会立即建立网络连接）。
 
@@ -334,6 +344,12 @@ class BaiduTranslator:
             transport: 自定义传输层，便于测试注入。
             salt_factory: ``salt`` 生成器，默认随机数（单测注入固定值）。
             clock: 熔断器时钟注入点。
+            premium: 账号是否为**企业尊享版**。百度的语言能力按档位切：
+                标准版/高级版只认 28 个常见语种，其余非常用语种（土耳其语、
+                印尼语、印地语、格鲁吉亚语……共 11 个在本项目白名单内）一律
+                回 ``58001``。默认 ``False``，即按标准版口径**前置拒绝**，
+                让调用方看到"这个语言方向要尊享版"；升级后设
+                ``IMGTRANS_BAIDU_PREMIUM=1`` 才放开。
 
         Raises:
             ValueError: 缺 APP ID / 密钥，或参数非法。**启动期就报**，
@@ -374,6 +390,8 @@ class BaiduTranslator:
         )
         #: 通道标识，供 ``/healthz`` 与启动日志展示。
         self.kind: str = "baidu"
+        #: 账号档位：``False`` = 标准版/高级版（28 个常见语种），``True`` = 企业尊享版。
+        self.premium: bool = bool(premium)
         #: 最近一次 ``translate_batch`` 的整体失败原因；成功后清空。
         #: ``None`` = 这一轮没出故障（注意：图里没有可译文字时也是 ``None``）。
         #: 上层据此区分"正常返回原图"和"通道挂了却返回原图"。
@@ -382,6 +400,38 @@ class BaiduTranslator:
     # ------------------------------------------------------------------ #
     # 公共 API
     # ------------------------------------------------------------------ #
+
+    def unsupported_target_reason(self, target: str | None) -> str | None:
+        """当前账号档位能否翻这个目标语言；能翻返回 ``None``，否则返回原因。
+
+        pipeline 在**解码图片之前**调它，参数不对就立刻 400，不浪费一次
+        OCR（15 秒）和一次翻译。
+
+        为什么不能等百度回错误码：非常用语种拿到的是 ``58001 译文语言方向
+        不支持``，"方向不支持"字面上像通道故障或码写错，而真实原因只有一个
+        ——账号档位不够。官方原文：*个人标准版和高级版支持 28 个常见语种，
+        企业尊享版支持全部语种*。本方法把这个判断搬到本地，报错就能说人话。
+
+        Args:
+            target: 目标语言码（Google 风格或百度风格均可）。
+
+        Returns:
+            ``None`` 表示可用；否则是一句可直接展示给调用方的原因。
+        """
+        if not target:
+            return None
+        code = to_baidu_lang(target)
+        if not code:
+            return f"百度没有 {target!r} 这个语言码"
+        if self.premium or code in BAIDU_STANDARD_CODES:
+            return None
+        canonical = normalize_lang(target) or target
+        return (
+            f"百度标准版/高级版不支持 {canonical}：只有 28 个常见语种可用，"
+            "该语言属非常用语种，需开通企业尊享版；"
+            "可改用 Google 通道，或换成 "
+            + "/".join(sorted(BAIDU_STANDARD_LANGS))
+        )
 
     def translate_batch(
         self,
@@ -400,8 +450,12 @@ class BaiduTranslator:
             与 ``texts`` 等长、同序的译文列表。
 
         Raises:
-            ValueError: ``target`` 为空或不在百度的语言表里。
+            ValueError: ``target`` 为空、不在百度的语言表里，或当前账号档位
+                不支持该语言方向（非常用语种要企业尊享版）。
         """
+        reason = self.unsupported_target_reason(target)
+        if reason:
+            raise ValueError(f"baidu: {reason}")
         target_code = to_baidu_lang(target)
         if not target_code:
             raise ValueError(f"target language is not supported by baidu: {target!r}")

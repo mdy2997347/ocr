@@ -76,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="百度通道密钥（默认取 IMGTRANS_BAIDU_SECRET）",
     )
     parser.add_argument(
+        "--premium",
+        action="store_true",
+        help="百度账号为企业尊享版（默认取 IMGTRANS_BAIDU_PREMIUM=1）。"
+        "不开时非常用语种（tr/id/hi/ka/uk/he/hr/sl/ms/no/bn）会在本地被拒",
+    )
+    parser.add_argument(
         "--prefer",
         default=None,
         choices=["api", "free"],
@@ -153,9 +159,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 那里给的提示比"签名错误 54001"有用得多。
         kwargs["appid"] = args.appid or os.environ.get("IMGTRANS_BAIDU_APPID", "")
         kwargs["secret"] = args.secret or os.environ.get("IMGTRANS_BAIDU_SECRET", "")
+        premium = args.premium or (
+            os.environ.get("IMGTRANS_BAIDU_PREMIUM", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        kwargs["premium"] = premium
 
     translator = get_translator(args.kind, **kwargs)
-    results = translator.translate_batch(texts, args.source, args.target)
+    try:
+        results = translator.translate_batch(texts, args.source, args.target)
+    except ValueError as exc:
+        # 语言方向不受档位支持、语言码不认识——这类是参数问题，不是崩溃，
+        # 打一行就够，别让 traceback 把真正的原因淹掉。
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
 
     if args.plain:
         for line in results:

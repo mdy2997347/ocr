@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 
 from ..downloader import MAX_BYTES
 from ..pipeline import ImageTranslatePipeline
+from ..translator import target_unavailable_reason
 from ..translator.lang_map import SUPPORTED_LANGS
 from ..types import ImageFetchError, ImageTranslateError, OcrError
 
@@ -299,12 +300,29 @@ def create_app(
 
     @app.get("/v1/languages")
     def languages() -> dict[str, Any]:
-        """返回支持的目标语言码。
+        """返回**当前部署实际能翻**的目标语言码。
 
         把白名单做成接口，PHP 侧就能在后台下拉框里直接拉，不用两边各维护
         一份语言列表——那种双写迟早会不一致。
+
+        注意"白名单"和"当前通道能翻"是两件事：百度标准版只有 28 个常见语种，
+        35 个目标语言里有 11 个要企业尊享版。接口若照旧返回全量，后台下拉框
+        会给出翻不了的语言，用户选了才拿到 58001。所以这里按通道能力过滤，
+        并把被排除的连同原因一起返回——前端可以直接置灰加提示。
         """
-        return {"targets": list(SUPPORTED_LANGS), "count": len(SUPPORTED_LANGS)}
+        translator = pipeline.translator
+        targets: list[str] = []
+        excluded: list[dict[str, str]] = []
+        for code in SUPPORTED_LANGS:
+            reason = target_unavailable_reason(translator, code)
+            if reason:
+                excluded.append({"code": code, "reason": reason})
+            else:
+                targets.append(code)
+        payload: dict[str, Any] = {"targets": targets, "count": len(targets)}
+        if excluded:
+            payload["excluded"] = excluded
+        return payload
 
     @app.post("/v1/translate", dependencies=[auth])
     def translate_url(

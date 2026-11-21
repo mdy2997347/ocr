@@ -23,7 +23,7 @@ OCR → 段落聚合 → 翻译 → 遮罩 → 擦除 → 样式分析 → 回�
 |---|---|---|
 | OCR | PaddleOCR 检测 + 识别 | 输出四点框（OBB），保留倾斜角与竖排方向 |
 | 段落聚合 | 同一栏、同方向的相邻块合并成段 | 翻译整段才有上下文；单字翻译质量明显更差 |
-| 翻译 | Google 通道，35 个目标语言 | 免费 `web` 通道，需能访问 Google |
+| 翻译 | Google / 百度双通道，35 个目标语言 | Google 免费 `web` 通道需能访问 Google；百度可直连，但标准版只有 28 个常见语种 |
 | 遮罩 | 每块单独估背景色、前景色、边框 | 背景色选错会连带 mask、擦除、字色全错 |
 | 擦除 | 纯色填充 → 平面拟合 → `cv2.inpaint` 三级降级 | 优先用能算出来的，算不出来才让 OpenCV 猜 |
 | 样式分析 | 字号、颜色、描边、粗细、对齐 | 拿不准时返回保守值：宁可少还原，不要还原错 |
@@ -72,6 +72,7 @@ uv run python scripts/serve.py --port 8000
 | `IMGTRANS_BAIDU_APPID` / `_SECRET` | 空 | `baidu` 通道凭证。APP ID 是**纯数字**，密钥是另一串，混填报 `54001` |
 | `IMGTRANS_BAIDU_QPS` | `1` | 百度标准版只有 1 QPS，高级版可设 10 |
 | `IMGTRANS_BAIDU_PROXY` | 空 | 百度通道专用代理。**不继承** `IMGTRANS_PROXY`（那是给 Google 出海用的） |
+| `IMGTRANS_BAIDU_PREMIUM` | `0` | 是否企业尊享版。留 `0` 时 11 个非常用语种（tr/id/hi/ka/uk/he/hr/sl/ms/no/bn）在入口即被拒并说明原因；开通尊享版后设 `1` |
 | `IMGTRANS_OCR_PROFILE` | `quality` | `quality` / `fast`（只换检测模型，CPU 上快一倍，见下） |
 | `IMGTRANS_OCR_DET_SIDE_LEN` | 空 | 检测长边上限，默认 736；调小约再快 15%，密集小字会漏 |
 | `IMGTRANS_FONT_DIRS` | 空 | 额外字体目录，多个用 `;` 或 `:` 分隔 |
@@ -139,6 +140,15 @@ uv run python scripts/translate_image.py --input a.jpg --to en --dry-run
 **语言码统一按 Google 风格传**（`ja` / `ko` / `fr` / `es` / `he`）。百度通道用的是另一套写法
 （`jp` / `kor` / `fra` / `spa` / `heb`），服务内部会自己映射；如果你手边已有百度写法，
 直接传也能用，两种写法完全等价，返回与日志里只会出现 Google 风格。
+
+**百度通道的语言边界**：百度按账号档位切语言能力——个人标准版和高级版只有 **28 个常见语种**，
+其余属"非常用语种"，要**企业尊享版**才翻得了。本项目 35 个目标语言里有 11 个属于后者：
+`bn`（孟加拉）`he`（希伯来）`hi`（印地）`hr`（克罗地亚）`id`（印尼）`ka`（格鲁吉亚）
+`ms`（马来）`no`（挪威）`sl`（斯洛文尼亚）`tr`（土耳其）`uk`（乌克兰）。
+
+这 11 个语言在请求入口就会被拒（`E_LANG`），错误信息会写明是档位不够，而不是让 OCR 白跑
+一趟再拿到百度的 `58001`。`/v1/languages` 也按当前通道的实际能力返回，被排除的语言列在
+`excluded` 里并附原因。开通尊享版后设 `IMGTRANS_BAIDU_PREMIUM=1` 即放开。
 
 ## HTTP API
 

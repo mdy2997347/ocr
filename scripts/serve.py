@@ -162,6 +162,11 @@ def main() -> int:
             file=sys.stderr,
         )
         baidu_qps = 1.0
+    # 账号档位：标准版/高级版只认 28 个常见语种，非常用语种（tr/id/hi/ka/uk…）
+    # 要企业尊享版才可用。默认按标准版口径前置拒绝，报错就能说清原因；
+    # 升级后设 IMGTRANS_BAIDU_PREMIUM=1 放开（否则等于白买了还翻不了）。
+    baidu_premium = (os.environ.get("IMGTRANS_BAIDU_PREMIUM") or "").strip().lower()
+    baidu_premium = baidu_premium in ("1", "true", "yes", "on")
     try:
         translator = build_translator(
             args.translator,
@@ -173,6 +178,7 @@ def main() -> int:
             baidu_appid=baidu_appid,
             baidu_secret=baidu_secret,
             baidu_qps=baidu_qps,
+            baidu_premium=baidu_premium,
         )
     except ValueError as exc:
         print(f"拒绝启动：{exc}", file=sys.stderr)
@@ -202,10 +208,11 @@ def main() -> int:
     # 设备确认之后才报监听地址：日志顺序就是启动顺序，
     # 先喊"监听中"再因为设备配错退出，会让人以为服务起过又挂了。
     logging.info(
-        "监听 %s:%s，翻译通道 %s，OCR 档位 %s，翻译代理 %s，图片下载代理 %s，鉴权 %s",
+        "监听 %s:%s，翻译通道 %s%s，OCR 档位 %s，翻译代理 %s，图片下载代理 %s，鉴权 %s",
         args.host,
         args.port,
         getattr(translator, "kind", args.translator),
+        "（企业尊享版）" if baidu_premium else "",
         ocr_profile,
         channel_proxy or "无",
         args.proxy or "无",

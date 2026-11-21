@@ -52,6 +52,7 @@ __all__ = [
     "is_supported_lang",
     "lookup_auto",
     "normalize_lang",
+    "target_unavailable_reason",
     "to_baidu_lang",
 ]
 
@@ -96,6 +97,30 @@ def get_translator(kind: str = "web", **kwargs: Any) -> Any:
     return factory(**kwargs)
 
 
+def target_unavailable_reason(translator: Any, target: str | None) -> str | None:
+    """问通道"这个目标语言你翻得了吗"；能翻返回 ``None``，否则返回原因。
+
+    通道可以自愿实现 ``unsupported_target_reason(code)`` 来声明自己的能力边界
+    ——目前只有百度需要：它按**账号档位**切语言，标准版/高级版 28 个常见语种，
+    非常用语种要企业尊享版。没实现该方法的通道一律视为"全都支持"。
+
+    用 ``getattr`` 探测而不是给 :class:`BaseTranslator` 加方法：新增通道时
+    不必为了满足协议写一个永远返回 ``None`` 的空实现，也不会因为忘了实现
+    而在运行期才炸。
+
+    Args:
+        translator: 翻译器实例，可为 ``None``（表示"还不知道通道"，按支持处理）。
+        target: 目标语言码，调用方应传已归一的规范码。
+
+    Returns:
+        ``None`` 表示可用；否则是一句可直接展示给调用方的原因。
+    """
+    checker = getattr(translator, "unsupported_target_reason", None)
+    if not callable(checker):
+        return None
+    return checker(target)
+
+
 def build_translator(
     kind: str = "web",
     *,
@@ -107,6 +132,7 @@ def build_translator(
     baidu_appid: str | None = None,
     baidu_secret: str | None = None,
     baidu_qps: float = 1.0,
+    baidu_premium: bool = False,
 ) -> Any:
     """按通道名建翻译器，屏蔽"各条通道构造参数完全不同"的差异。
 
@@ -127,6 +153,9 @@ def build_translator(
         baidu_appid: baidu 通道的 APP ID（纯数字，**不是密钥**）。
         baidu_secret: baidu 通道的密钥。
         baidu_qps: baidu 通道的请求速率上限。标准版 1 QPS，高级版可设 10。
+        baidu_premium: baidu 账号是否为企业尊享版。默认 ``False`` 时按标准版
+            口径处理：非常用语种（11 个，含 tr/id/hi/ka/uk）前置拒绝并给出
+            "需尊享版"的提示，而不是等接口回 ``58001`` 那种看不出所以然的错。
 
     Returns:
         翻译器实例。cloud 通道**构造是惰性的**：缺 ``google-cloud-translate``
@@ -156,6 +185,7 @@ def build_translator(
             proxy=proxy,
             timeout=timeout,
             qps=baidu_qps,
+            premium=baidu_premium,
         )
     raise ValueError(
         f"unknown translator kind: {kind!r}; "

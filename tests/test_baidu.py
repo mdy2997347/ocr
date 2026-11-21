@@ -35,6 +35,7 @@ from imgtrans.translator.baidu import (
 )
 from imgtrans.translator.lang_map import (
     BAIDU_LANGS,
+    BAIDU_STANDARD_LANGS,
     SUPPORTED_LANGS,
     is_supported_lang,
     normalize_lang,
@@ -561,6 +562,82 @@ class TestBaiduStyleCompat(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertEqual(normalize_lang(code), "")
                 self.assertEqual(to_baidu_lang(code), "")
+
+
+class TestAccountTier(unittest.TestCase):
+    """账号档位划出的语言边界：标准版 28 个常见语种，非常用语种要尊享版。
+
+    实测依据（2026-11，用真实 APPID 逐个打 35 个方向）：24 个返回译文、
+    11 个一律 ``58001``，且**与源语言无关**（``en→X`` 同样被拒）。
+    官方文档给出的解释是档位限制，不是我们映射错或方向没开通。
+    """
+
+    #: 实测被 58001 拒绝的 11 个，百度归入"非常用语种"
+    PREMIUM_ONLY = ("bn", "he", "hi", "hr", "id", "ka", "ms", "no", "sl", "tr", "uk")
+
+    def test_standard_langs_cover_exactly_24(self) -> None:
+        """标准版可用目标语言 = 35 - 11 = 24，与接口实测一一对应。"""
+        self.assertEqual(len(BAIDU_STANDARD_LANGS), 24)
+        self.assertEqual(
+            sorted(set(SUPPORTED_LANGS) - BAIDU_STANDARD_LANGS),
+            sorted(self.PREMIUM_ONLY),
+        )
+
+    def test_common_langs_pass(self) -> None:
+        """24 个常见语种不拦截。"""
+        tr = make(FakeTransport(responses=[ok(("a", "b"))]))
+        for code in sorted(BAIDU_STANDARD_LANGS):
+            with self.subTest(code=code):
+                self.assertIsNone(tr.unsupported_target_reason(code))
+
+    def test_premium_only_langs_rejected_with_hint(self) -> None:
+        """11 个非常用语种被拒，提示要"尊享版"而不是含糊的"通道不可用"。"""
+        tr = make(FakeTransport(responses=[ok(("a", "b"))]))
+        for code in self.PREMIUM_ONLY:
+            with self.subTest(code=code):
+                reason = tr.unsupported_target_reason(code)
+                self.assertTrue(reason)
+                self.assertIn("尊享版", reason)
+                self.assertIn(code, reason)
+
+    def test_premium_flag_opens_them(self) -> None:
+        """开通尊享版（premium=True）后不再拦截。"""
+        tr = make(FakeTransport(responses=[ok(("a", "b"))]), premium=True)
+        for code in self.PREMIUM_ONLY:
+            with self.subTest(code=code):
+                self.assertIsNone(tr.unsupported_target_reason(code))
+
+    def test_rejected_before_any_request(self) -> None:
+        """拒绝发生在发请求之前：不烧配额、不占 QPS。"""
+        transport = FakeTransport(responses=[ok(("苹果", "apple"))])
+        tr = make(transport)
+        with self.assertRaises(ValueError) as ctx:
+            tr.translate_batch(["苹果"], None, "ka")
+        self.assertEqual(transport.calls, [])
+        self.assertIn("尊享版", str(ctx.exception))
+
+    def test_pipeline_rejects_before_decode(self) -> None:
+        """pipeline 在解码前就抛 E_LANG，不必跑完 OCR 才知道语言不支持。"""
+        from imgtrans.pipeline import _require_target_lang
+        from imgtrans.types import UnsupportedLangError
+
+        tr = make(FakeTransport(responses=[ok(("a", "b"))]))
+        with self.assertRaises(UnsupportedLangError) as ctx:
+            _require_target_lang("ka", tr)
+        self.assertIn("尊享版", str(ctx.exception))
+        # 常见语种照常通过，且仍归一成规范码
+        self.assertEqual(_require_target_lang("jp", tr), "ja")
+
+    def test_channels_without_declaration_are_unaffected(self) -> None:
+        """没声明能力的通道（Google）行为不变；旧的两参调用也不能炸。"""
+        from imgtrans.pipeline import _require_target_lang
+
+        class Plain:
+            def translate_batch(self, texts, source, target):
+                return texts
+
+        self.assertEqual(_require_target_lang("ka", Plain()), "ka")
+        self.assertEqual(_require_target_lang("ka"), "ka")
 
 
 class TestBuildTranslator(unittest.TestCase):

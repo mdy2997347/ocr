@@ -38,6 +38,7 @@ from .ocr.group import group_blocks
 from .render.fonts import FontBook, font_dirs_from_env
 from .render.style import analyze_style
 from .render.text import render_blocks
+from .translator import target_unavailable_reason
 from .translator.base import BaseTranslator
 from .translator.lang_map import SUPPORTED_LANGS, normalize_lang
 from .types import (
@@ -230,7 +231,7 @@ class ImageTranslatePipeline:
         # 先校验语言再下载。顺序反了会有两个坏结果：参数错却先发一次出网
         # 请求；URL 不通时 ``E_LANG`` 被下载失败掩盖成 ``E_IMAGE_FETCH``，
         # 调用方按错误码排查会查错方向（实测踩到：传 lang=zh + 404 的 URL）。
-        target_lang = _require_target_lang(target_lang)
+        target_lang = _require_target_lang(target_lang, self._translator)
         fetched = fetch_image(url, proxy=proxy)
         return self.translate_bytes(
             fetched.content, target_lang, source_lang, mime=fetched.mime
@@ -245,7 +246,7 @@ class ImageTranslatePipeline:
         mime: str | None = None,
     ) -> PipelineResult:
         """翻译内存中的图片字节。"""
-        target_lang = _require_target_lang(target_lang)
+        target_lang = _require_target_lang(target_lang, self._translator)
         timings: dict[str, float] = {}
         warnings: list[str] = []
 
@@ -533,20 +534,35 @@ class ImageTranslatePipeline:
 # ---------------- 编解码 ----------------
 
 
-def _require_target_lang(code: str) -> str:
+def _require_target_lang(
+    code: str, translator: BaseTranslator | None = None
+) -> str:
     """校验并归一目标语言码，非法直接抛 :class:`UnsupportedLangError`。
 
     放在解码**之前**：参数错就不该浪费一次解码 + 一次 15 秒的 OCR。
     错误信息里带上完整清单，调用方不必翻文档就知道该传什么。
+
+    除了"语言码是否认识"，还要问通道"这个方向你能不能翻"。两者是不同的
+    失败：前者是调用方拼错（改参数即可），后者是通道能力边界（百度标准版
+    只认 28 个常见语种，其余要企业尊享版）。合并判断的理由是它们对调用方
+    的处置方式一样——换个语言，或者换个通道；放在一起就不会出现"OCR 跑完
+    才告诉你语言不支持"这种白烧 15 秒的路径。
     """
     normalized = normalize_lang(code)
-    if normalized:
-        return normalized
-    raise UnsupportedLangError(
-        f"不支持的目标语言: {code!r}；支持 {len(SUPPORTED_LANGS)} 种: "
-        + ", ".join(SUPPORTED_LANGS)
-        + "（也接受百度风格码 jp/kor/fra/spa 等，内部会归一为上述写法）"
-    )
+    if not normalized:
+        raise UnsupportedLangError(
+            f"不支持的目标语言: {code!r}；支持 {len(SUPPORTED_LANGS)} 种: "
+            + ", ".join(SUPPORTED_LANGS)
+            + "（也接受百度风格码 jp/kor/fra/spa 等，内部会归一为上述写法）"
+        )
+    # 通道自带的能力声明。用 getattr 探测而不是 isinstance：新增通道时不必
+    # 回来改这里，没想到声明能力的通道默认"全都支持"。
+    reason = target_unavailable_reason(translator, normalized)
+    if reason:
+        raise UnsupportedLangError(
+            f"目标语言 {normalized!r} 在当前翻译通道不可用：{reason}"
+        )
+    return normalized
 
 
 def _decode_image(data: bytes) -> tuple[np.ndarray, bytes | None]:
