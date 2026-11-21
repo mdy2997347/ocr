@@ -194,6 +194,7 @@ scripts/
   verify_live.py     翻译通道在线探针
   render_lab.py      回填沙盘：合成图集，秒级出图
   render_eval.py     回填几何评估：把"像不像"量化
+  fidelity_report.py 版式自检：一张图量出聚合判据与缩放一致性
 tests/         300+ 个用例，按模块分文件
 deploy/        systemd unit、install.sh、nginx conf
 docs/          技术设计、部署、API、Go 重写方案
@@ -209,11 +210,16 @@ uv run python -m unittest discover -s tests -t . -q
 uv run python scripts/render_lab.py            # 出图到 out/lab/
 uv run python scripts/render_eval.py           # 打印几何指标，有偏差会标出来
 
+# 某张图上聚合判据到底取了什么值、缩放后是否还一致（不调翻译，不写文件）
+uv run python scripts/fidelity_report.py --input a.png
+
 # 翻译通道是否真的可用（单测只证明逻辑对，不证明 Google 接受签名）
 uv run python scripts/verify_live.py
 ```
 
 回填这块为什么单独做沙盘：完整链路一次要 60 秒以上，且每次输入都不同，没法稳定复现某一种排版失败。沙盘直接构造 `TextBlock`，只跑"擦除 → 样式 → 回填"，秒级出图、场景可控，`render_eval.py` 再把倾斜角、字号比、中心偏移量成数字——人眼看图容易漏，也难做回归。
+
+段落聚合同理，走的是**生成版式**：`tests/test_layout_generalization.py` 自己画版式（行距、段间距、字号、段内行数、栏数），所以每块属于哪一段是已知真值，改判据就能立刻看出坏在哪组参数上，而不需要攒一堆真图来试。另有一条硬约束：同一版式放大缩小后段落划分必须一致——`fidelity_report.py` 把这条也做成了可执行检查。
 
 ## 部署
 
