@@ -251,6 +251,37 @@ uv run python scripts/doctor.py
 `ka` 的候选里有 `DejaVuSans.ttf`，名字对得上，但如果那台机器上的版本没有格鲁吉亚字形，
 照样一片方框。缺字体时先装 `fonts-noto-core`（含格鲁吉亚/泰/天城/孟加拉），重启即可。
 
+### 字都在，但排错了：整形（Raqm）
+
+字体覆盖只解决"有没有这个字"。孟加拉（`bn`）、天城（`hi`）、泰（`th`）、
+阿拉伯（`ar`）、希伯来（`he`）还要**整形**：元音符号要挪到辅音的左侧或上下、
+辅音之间要合成连字（`ক্ষ` 是一个字形），RTL 要从右往左排。这些 FreeType 不做，
+只有 Pillow 的 Raqm 排版引擎（HarfBuzz + FriBiDi）会做。
+
+缺 Raqm 时图上**每个字都在**，只是拼写是错的——接口照样返回 200，日志只有一条
+UserWarning。中文用户看不出问题，当地人一眼就知道错。所以启动日志多了一行：
+
+```
+整形自检：Raqm 可用，复杂文字按 HarfBuzz 规则排版
+整形自检：Pillow 没有 Raqm（缺 FriBiDi），5 个语言会排错：ar, bn, he, hi, th
+  这些语言的元音符号位置、辅音连字、RTL 顺序都会不正确，但图上仍有字形（不是方框）。
+```
+
+修复（Ubuntu）：
+
+```bash
+apt-get install -y libraqm0 libfribidi0 && systemctl restart imgtrans
+```
+
+Pillow 是**运行时**才 dlopen 这两个库的（有的 wheel 静默内置、有的是动态链接，
+本机实测 Pillow 13 的 win_amd64 wheel 导入表里同时有 `libraqm` 与 `fribidi`），
+所以装完必须重启——整形能力只在启动阶段探测一次。Windows 上把 `libraqm.dll`
+与 `fribidi-0.dll` 放进 `python.exe` 同目录。
+
+代码上还有一处容易踩的坑：有 Raqm 时**不要**再手工做 RTL 重排。
+`shape_rtl_text()`（arabic_reshaper + bidi）是没 Raqm 时的降级路径，
+两条同时走会翻转两次，文字又倒回去。判定集中在 `shaped_for_paint()`。
+
 手工部署与排障见 [docs/ubuntu-deploy.md](docs/ubuntu-deploy.md) 和 [docs/linux-deploy.md](docs/linux-deploy.md)。
 
 ### Google 通道报「两个通道均失败」
@@ -285,6 +316,11 @@ message 末尾会带 `代理 http://…` 或 `未配置代理（直连）`，`/h
   核对 cmap 覆盖：本族能画就用本族；本族不行但有别族能画就换族（日志说明换了谁）；谁都没
   覆盖则选覆盖最多的族，把缺的字写进 `blocks[].note`（"字体缺字形，这些字被画成了方框：…"）
   并在响应 `warnings` 里抬一条。所以看到方框时，先看这两处说了什么，再去装字体。
+- **整形（Raqm）缺失时字形齐全、拼写错误**。`bn`/`hi`/`th`/`ar`/`he` 缺 Raqm 时不会画方框，
+  而是元音符号站错位置、连字被拆开、RTL 整行反向——接口 200、日志只有一条 UserWarning。
+  启动日志的"整形自检"那一行会点名受影响的语言；修复见上文（装 `libraqm0 libfribidi0` 后重启）。
+  没有 Raqm 时 RTL 会退到 `arabic_reshaper`+`bidi` 手工路径，但它只覆盖阿拉伯/希伯来，
+  孟加拉与天城文**没有等价降级方案**，只能装库。
 - **照片背景上的大字**擦除仍走 TELEA 扩散，会留下可见的涂抹感。要根治得做 exemplar / PatchMatch 纹理合成，属于另一个量级的改动。
 - **擦除后会自动复检框边**（`erase_residuals`，默认开）。OCR 框贴着字形，右括号/中文标点偶尔溢出框 1~2px，mask 盖不到就留一道黑线；复检按"与框外背景色差"补，只补小碎块，横贯整块的细线（表格分隔线、边框）会跳过。仍然有两种情况会漏：溢出超过 3px（复检环宽度），以及残墨与背景对比低于 24/255（肉眼基本不可见）。
 - **竖排标点不旋转**。日文的 `。，` 应落在字符格右上，目前是正着画的。

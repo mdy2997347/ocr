@@ -341,5 +341,117 @@ class FamilyKeyPassthroughTest(unittest.TestCase):
         self.assertEqual(family_for_lang(None), "cjk")
 
 
+class ShapingTest(unittest.TestCase):
+    """复杂文字：字形全都在，但排列是错的——比方块更难发现。
+
+    孟加拉文的 ি 要画到辅音**左侧**、ক্ষ 要合成一个连字、阿拉伯文要从右往左。
+    这些 FreeType 一概不做，只有 Raqm（HarfBuzz + FriBiDi）会做。缺 Raqm 时
+    Pillow 收到 ``layout_engine=RAQM`` **不报错**，只发一条 UserWarning 就退回
+    basic layout，所以"检测到了"和"接线了"必须分别钉住。
+    """
+
+    def setUp(self) -> None:
+        self._orig = fonts._RAQM_AVAILABLE
+        self.addCleanup(self._restore_raqm)
+
+    def _restore_raqm(self) -> None:
+        fonts._RAQM_AVAILABLE = self._orig
+
+    def test_shaping_languages_are_flagged(self) -> None:
+        for code in ("bn", "hi", "th", "ar", "he"):
+            self.assertTrue(fonts.needs_shaping(code), f"{code} 需要整形")
+        for code in ("en", "zh", "ja", "ko", "ka", "ru", "vi"):
+            self.assertFalse(fonts.needs_shaping(code), f"{code} 不需要整形")
+
+    def _spy_truetype(self, lang: str) -> dict:
+        """取 ``get_font`` 传给 ``ImageFont.truetype`` 的关键字参数。"""
+        book = FontBook()
+        if book.find(lang) is None:
+            self.skipTest(f"本机没有能画 {lang} 的字体")
+        captured: dict = {}
+        real = fonts.ImageFont.truetype
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(fonts.ImageFont, "truetype", side_effect=spy):
+            book.get_font(lang, 20)
+        return captured
+
+    def test_raqm_engine_is_requested_when_available(self) -> None:
+        """只提供 has_raqm() 而不接线，等于什么都没修。"""
+        import warnings
+
+        from PIL import features as pil_features
+
+        fonts._RAQM_AVAILABLE = True
+        # 本机若真的没有 raqm，Pillow 只会发 UserWarning 然后退回 basic——
+        # 这条警告本身就是"为什么必须自己 check"的证据，顺手断言掉，
+        # 免得它混进测试输出被当成噪音忽略。
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            kwargs = self._spy_truetype("bn")
+        self.assertEqual(kwargs.get("layout_engine"), fonts.ImageFont.Layout.RAQM)
+        if not pil_features.check("raqm"):
+            self.assertTrue(
+                any("Raqm layout was requested" in str(w.message) for w in caught),
+                [str(w.message) for w in caught],
+            )
+
+    def test_latin_keeps_basic_layout(self) -> None:
+        """拉丁/中日韩不启用 RAQM：kerning 会让已调好的回填宽度发生偏移。"""
+        fonts._RAQM_AVAILABLE = True
+        kwargs = self._spy_truetype("en")
+        self.assertNotIn("layout_engine", kwargs)
+
+    def test_missing_raqm_warns_for_shaping_language(self) -> None:
+        """没有 Raqm 时必须留痕，不能安静地画出一段排错的文字。"""
+        fonts._RAQM_AVAILABLE = False
+        book = FontBook()
+        if book.find("bn") is None:
+            self.skipTest("本机没有能画 bn 的字体")
+        with self.assertLogs("imgtrans.render.fonts", level="WARNING") as logs:
+            book.get_font("bn", 20)
+        self.assertTrue(
+            any("整形" in line or "Raqm" in line for line in logs.output),
+            logs.output,
+        )
+
+
+class ShapedForPaintTest(unittest.TestCase):
+    """RTL 整形只能走一条路，走两条会翻转两次。"""
+
+    def setUp(self) -> None:
+        self._orig = fonts._RAQM_AVAILABLE
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        fonts._RAQM_AVAILABLE = self._orig
+
+    def test_raqm_gets_raw_logical_order(self) -> None:
+        from imgtrans.render import text as T
+
+        fonts._RAQM_AVAILABLE = True
+        arabic = "مرحبا"
+        with mock.patch.object(T, "shape_rtl_text", side_effect=AssertionError("不该手工翻转")):
+            self.assertEqual(T.shaped_for_paint(arabic, True), arabic)
+
+    def test_without_raqm_falls_back_to_manual_reorder(self) -> None:
+        from imgtrans.render import text as T
+
+        fonts._RAQM_AVAILABLE = False
+        arabic = "مرحبا"
+        with mock.patch.object(T, "shape_rtl_text", return_value="REORDERED") as spy:
+            self.assertEqual(T.shaped_for_paint(arabic, True), "REORDERED")
+        spy.assert_called_once_with(arabic)
+
+    def test_ltr_text_is_untouched(self) -> None:
+        from imgtrans.render import text as T
+
+        fonts._RAQM_AVAILABLE = False
+        self.assertEqual(T.shaped_for_paint("hello", False), "hello")
+
+
 if __name__ == "__main__":
     unittest.main()

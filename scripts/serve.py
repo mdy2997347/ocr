@@ -201,6 +201,8 @@ def main() -> int:
     # 档位名在这里就校验：写在 .env 里的拼写错误（qualityy / FAST 之外的
     # 乱写）应该在加载模型之前退出，而不是等服务起来、首个请求才炸。
     from imgtrans.ocr.engine import OCR_PROFILES
+    from imgtrans.render.fonts import has_raqm as font_has_raqm
+    from imgtrans.render.fonts import needs_shaping
 
     ocr_profile = (args.ocr_profile or "quality").strip().lower()
     if ocr_profile not in OCR_PROFILES:
@@ -266,6 +268,28 @@ def main() -> int:
                 logging.warning("  %s", line)
         else:
             logging.info("字体自检：%d 个目标语言全部有字体覆盖", len(SUPPORTED_LANGS))
+
+        # 整形自检与字体自检是两件事，缺一不可：字体装齐了只保证"有字"，
+        # 孟加拉/天城/泰/阿拉伯/希伯来还要 Raqm 才能把字排对（元音重排、
+        # 辅音连字、RTL 顺序）。缺 Raqm 时 Pillow 只发一条 Warning 就退回
+        # basic layout，图上照样有字——不主动查就会一直错下去。
+        if not font_has_raqm():
+            shaped = [c for c in SUPPORTED_LANGS if needs_shaping(c)]
+            logging.warning(
+                "整形自检：Pillow 没有 Raqm（缺 libraqm/FriBiDi），%d 个语言会排错：%s",
+                len(shaped),
+                ", ".join(shaped),
+            )
+            logging.warning(
+                "  这些语言的元音符号位置、辅音连字、RTL 顺序都会不正确，"
+                "但图上仍有字形（不是方框）。"
+            )
+            logging.warning(
+                "  修复：apt-get install -y libraqm0 libfribidi0 后重启；"
+                "Windows 需把 libraqm.dll 与 fribidi-0.dll 放到 python.exe 同目录。"
+            )
+        else:
+            logging.info("整形自检：Raqm 可用，复杂文字按 HarfBuzz 规则排版")
 
         return create_app(pipeline, proxy=args.proxy, warmup=not args.no_warmup)
 

@@ -115,13 +115,26 @@ def check_pillow(r: Report) -> None:
         return
 
     if has_raqm:
-        r.ok("Pillow raqm", "已启用（阿拉伯/天城文/泰文整形正常）")
+        r.ok("Pillow raqm", "已启用（孟加拉/天城/泰/阿拉伯/希伯来按 HarfBuzz 规则整形）")
     else:
+        # 依赖形态在不同 wheel 上并不一致：有的把 raqm 静态编进去（只差
+        # 运行时的 FriBiDi），有的是动态链接 libraqm（本机实测：Pillow 13
+        # 的 win_amd64 wheel 导入表里同时有 libraqm 与 fribidi）。所以
+        # 两个库都建议装上，别只装一个然后困惑"为什么不绿"。
+        try:
+            from imgtrans.render.fonts import needs_shaping
+            from imgtrans.translator.lang_map import SUPPORTED_LANGS
+
+            affected = [c for c in SUPPORTED_LANGS if needs_shaping(c)]
+        except Exception:  # noqa: BLE001
+            affected = ["bn", "hi", "th", "ar", "he"]
         r.warn(
             "Pillow raqm",
-            "未启用：阿拉伯语/印地语/孟加拉语/泰文会出现字母孤立、辅音簇错位。"
-            "pip 安装的 Pillow 官方 wheel 自带 raqm；系统包（apt install python3-pil）通常没有，"
-            "请改用 pip 安装或补装 libraqm0",
+            f"未启用：{', '.join(affected)} 共 {len(affected)} 个语言会排错"
+            "（元音符号位置、辅音连字、RTL 顺序），但图上仍有字形，肉眼不易发现。"
+            "Linux: `apt-get install -y libraqm0 libfribidi0`；"
+            "Windows: 把 libraqm.dll 与 fribidi-0.dll 放到 python.exe 同目录。"
+            "装完必须重启服务（字体与整形能力只在启动时探测）。",
         )
 
 

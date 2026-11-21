@@ -556,6 +556,7 @@ step_apt() {
     # 包清单每一项都是硬需求，缺了会静默出错（字体）或直接崩（libgomp1）
     local -a packages=(
         libgomp1                # paddle 的 OpenMP 运行时，缺了 import paddle 直接失败
+        libraqm0 libfribidi0    # 复杂文字整形：Pillow 运行时 dlopen 它们才能连字/RTL
         fonts-noto-cjk          # 中日韩：缺了全变方块 □，且不报错
         fonts-noto-core         # 阿拉伯/希伯来/泰/天城/孟加拉/格鲁吉亚
         fonts-dejavu-core       # 拉丁兜底（西里尔/希腊也靠它）
@@ -1361,6 +1362,9 @@ step_doctor() {
 常见 FAIL 与处理：
   * “依赖 xxx 未安装”        → 重跑 `uv sync --frozen --extra cpu`（GPU 机器 --extra gpu）
   * “字体索引 一个字体都没找到” → apt install fonts-noto-cjk fonts-dejavu-core fonts-noto-core
+  * “Pillow raqm 未启用”      → apt install libraqm0 libfribidi0（Pillow 运行时才加载它们），
+                                装完重启服务；孟加拉/天城/泰/阿拉伯/希伯来文缺它时
+                                字母全在、但元音位置与连字是错的，接口不报错
   * “字体 zh 回退到 DejaVuSans → 会画成豆腐块” → 同上，装 fonts-noto-cjk
   * “推理设备 xxx 不可用”     → 配了 gpu 但装的是 CPU 版 paddle；改 .env 的 IMGTRANS_DEVICE=cpu 或装 GPU 版
   * 推理报 “no kernel image is available” → 驱动或 wheel 的架构代对不上：

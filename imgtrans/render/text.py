@@ -27,7 +27,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from ..types import BlockStyle, RenderedBlock, TextBlock
-from .fonts import FontBook
+from .fonts import FontBook, has_raqm
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +321,22 @@ def shape_rtl_text(text: str) -> str:
     except Exception as exc:  # noqa: BLE001
         logger.warning("RTL 整形失败(%s)，按原文本绘制", exc)
         return text
+
+
+def shaped_for_paint(text: str, rtl: bool) -> str:
+    """决定交给 ``draw.text`` 的字符串。
+
+    RTL 有两种整形途径，**只能选一条**：
+
+    * 有 Raqm：把原始逻辑顺序喂进去，Raqm 内部用 FriBiDi 做 bidi + 连写；
+    * 没有 Raqm：先 :func:`shape_rtl_text` 手工转成显示顺序，再按 LTR 画。
+
+    两条同时走就会翻转两次——文字又倒回去，而且还在"看起来有字"的
+    状态下错，比整段失败更难发现。
+    """
+    if not rtl:
+        return text
+    return text if has_raqm() else shape_rtl_text(text)
 
 
 def wrap_text(
@@ -1316,8 +1332,12 @@ def render_blocks(
 
         # RTL 文字（阿拉伯/希伯来）必须整形 + 双向重排 + 右对齐，
         # 且扩展方向是向左（右端贴住原框右缘）。
+        #
+        # 但"谁来做重排"要看环境：有 Raqm 时由它（内部走 FriBiDi）在排版阶段
+        # 完成 bidi + 连写，这里必须喂**原始逻辑顺序**；如果还调 shape_rtl_text
+        # 先翻一遍，Raqm 会再翻一遍，结果是两次镜像 = 又倒回去。
         rtl = is_rtl_text(target)
-        paint_text = shape_rtl_text(target) if rtl else target
+        paint_text = shaped_for_paint(target, rtl)
         paint_style = style
         if rtl and style.align != "right":
             paint_style = replace(style, align="right")

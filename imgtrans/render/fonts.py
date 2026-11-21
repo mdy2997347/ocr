@@ -219,6 +219,16 @@ FONT_CANDIDATES: dict[str, tuple[str, ...]] = {
         "NotoSansGeorgian-Regular.ttf",
         "DejaVuSans.ttf",
     ),
+    # 希伯来文（he）。**必须独立成族**，不能挂 latin：
+    # 它和拉丁语共用族时，get_font 只拿到族名"latin"，无法判断这段文字
+    # 需要 RTL 整形，于是永远走 basic layout、整行文字被反过来画。
+    # Arial/Tahoma 自带希伯来字形（质量一般但覆盖全），Noto 更规整。
+    "hebrew": (
+        "arial.ttf",
+        "tahoma.ttf",
+        "NotoSansHebrew-Regular.ttf",
+        "DejaVuSans.ttf",
+    ),
 }
 
 #: 目标语言码 -> 字体族。未覆盖的回落到 cjk（覆盖面最广）。
@@ -275,8 +285,9 @@ _LANG_TO_FAMILY: dict[str, str] = {
     "fi": "latin",
     "et": "latin",
     "ms": "latin",
-    # 希伯来：Arial 自带希伯来字形，且方向由 is_rtl_text 处理
-    "he": "latin",
+    # 希伯来：独立族。挂在 latin 上会让"是否需要 RTL 整形"无从判断
+    # （get_font 只拿到族名），整行会被反向绘制。
+    "he": "hebrew",
     "bn": "bengali",
     "ka": "georgian",
 }
@@ -296,6 +307,7 @@ FONT_PROBE_TEXT: dict[str, str] = {
     "devanagari": "परीक्षण",
     "bengali": "পরীক্ষা",
     "georgian": "გამარჯობა",
+    "hebrew": "שלום",
     "latin": "Test 123",
 }
 
@@ -324,6 +336,35 @@ def family_for_lang(lang: str | None) -> str:
 #: 但中文/泰文/天城文回退到 DejaVu/Arial 就是铁定豆腐块。
 #: DejaVu 恰好带格鲁吉亚与阿拉伯字形，所以 ka/ar 只在 warning 一档。
 _LATIN_FALLBACK_LACKS = frozenset({"cjk", "ja", "ko", "th", "devanagari", "bengali"})
+
+#: 必须经过 **整形（shaping）** 才能画对的字体族。
+#:
+#: 这些文字不是"一个字符一个字形"：孟加拉/天城的元音符号要重排到辅音左右、
+#: 辅音之间要合成连字（ক্ষ）、reph 要挪位；阿拉伯文要按词首/词中/词末选形并
+#: 从右往左排；泰文的上下元音要叠在辅音上下。FreeType 只做字形光栅化，
+#: 不做这些，所以用 basic layout 画出来**每个字都有**、但拼写是错的——
+#: 比缺字形更隐蔽：当地用户一眼看出错，中文用户只会觉得"字有点怪"。
+#:
+#: 正确路径只有一条：Pillow 带 Raqm（HarfBuzz + FriBiDi）时按 RAQM 排版。
+#: 注意键名必须与 :data:`FONT_CANDIDATES` 一致（泰文族是 ``th`` 不是 ``thai``，
+#: 写错就整族漏判，且不会有任何报错）。
+_SHAPING_FAMILIES = frozenset({"bengali", "devanagari", "th", "ar", "hebrew"})
+
+#: 还需要整形的**语言码**，与 :data:`_SHAPING_FAMILIES` 互为兜底。
+#:
+#: 主判据是族名（:meth:`FontBook.get_font` 收到的可能就是族名）；语言码这
+#: 一层补上映射表将来拆族的情况（mr/ne 天城小语种、fa/ur 阿拉伯语支）。
+_SHAPING_LANGS = frozenset({"bn", "hi", "mr", "ne", "th", "ar", "fa", "ur", "he"})
+
+
+def needs_shaping(lang: str | None) -> bool:
+    """该目标语言是否必须整形才能画对（不看当前环境有没有 Raqm）。"""
+    if not lang:
+        return False
+    key = lang.strip().lower().replace("_", "-")
+    if key.split("-")[0] in _SHAPING_LANGS:
+        return True
+    return family_for_lang(key) in _SHAPING_FAMILIES
 
 #: .ttc 里按 face 名挑字形所需的 token。
 #:
@@ -491,7 +532,8 @@ class FontBook:
         """
         self._extra_dirs = [Path(d) for d in (font_dirs or [])]
         self._index: dict[str, Path] | None = None
-        self._cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+        # 键第三项是"是否启用 Raqm"：同一族在不同语言下可能要走不同排版引擎
+        self._cache: dict[tuple[str, int, bool], ImageFont.FreeTypeFont] = {}
         self._face_cache: dict[Path, int] = {}
         #: 字体文件 -> 它 cmap 里的码位集合（``None`` 表示读不出）。
         #: 一个字体只解析一次：中文字体两万多个码位，逐块重解析会明显变慢。
@@ -764,7 +806,13 @@ class FontBook:
         极端情况下没有任何字体文件，退回 Pillow 内置位图字体——
         它无法缩放，只保证"能画出来不崩"，字形会很粗糙。
         """
-        key = (family_for_lang(lang), max(1, int(size)))
+        # 缓存键带上"是否整形"：整形与否由**语言**决定，而不同语言可能落在
+        # 同一族（例如 he 若因换族落到 latin，就与 en 共用族名）。只用
+        # (族, 字号) 时，先渲染的那个会把字体对象缓存下来，后来者直接命中——
+        # 该整形的拿到 basic 对象（RTL 永远排不对），不该整形的拿到 RAQM 对象
+        # （多出 kerning，宽度偏移）。
+        use_raqm = needs_shaping(lang) and has_raqm()
+        key = (family_for_lang(lang), max(1, int(size)), use_raqm)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
@@ -777,8 +825,22 @@ class FontBook:
         else:
             family = key[0]
             index = self._face_index(path, family)
+            # 只对"必须整形"的语言启用 RAQM：Raqm 会额外做 kerning 与连字替换，
+            # 中文/日文/拉丁的排版宽度会有微小变化，而这几类的回填效果是逐像素
+            # 调过的，没必要为了不需要的功能去动它。南亚/泰/阿拉伯/希伯来则
+            # 相反——不开 RAQM 画出来的拼写就是错的。
+            kwargs: dict[str, object] = {}
+            if use_raqm:
+                kwargs["layout_engine"] = ImageFont.Layout.RAQM
+            elif needs_shaping(lang):
+                logger.warning(
+                    "语言 %s 需要文本整形，但当前 Pillow 没有 Raqm："
+                    "字母顺序/元音位置/连字都会不正确（不是缺字形，"
+                    "图上仍有字）。Linux 装 libraqm0 libfribidi0 后重启可修复。",
+                    lang,
+                )
             try:
-                font = ImageFont.truetype(str(path), size=key[1], index=index)
+                font = ImageFont.truetype(str(path), size=key[1], index=index, **kwargs)
             except OSError as exc:
                 logger.warning("加载字体 %s 失败(%s)，回退默认字体", path, exc)
                 font = ImageFont.load_default()  # type: ignore[assignment]
@@ -787,16 +849,34 @@ class FontBook:
         return font
 
 
+#: ``has_raqm()`` 的结果缓存。形态判定在进程生命周期内不变，但
+#: ``features.check`` 每次都要去 dlopen 一遍 FriBiDi，单次 0.05ms，渲染
+#: 循环里按块调用就是白白浪费。测试可把它置回 ``None`` 重新探测。
+_RAQM_AVAILABLE: bool | None = None
+
+
 def has_raqm() -> bool:
     """Pillow 是否编译了 Raqm（复杂文字整形）。
 
-    阿拉伯/泰文/天城文**必须**有 Raqm 才能正确连字与排列，
-    否则字母会各自孤立、RTL 不镜像。Pillow 官方 wheel 自带 Raqm，
-    系统包管理器安装的版本常常没有。
-    """
-    try:
-        from PIL import features
+    阿拉伯/泰文/天城文/孟加拉文**必须**有 Raqm 才能正确连字与排列，
+    否则字母会各自孤立、元音符号错位、RTL 不镜像。
 
-        return bool(features.check("raqm"))
-    except Exception:  # noqa: BLE001
-        return False
+    注意 Pillow 的两个陷阱：
+
+    1. 请求 ``layout_engine=Layout.RAQM`` 而 Raqm 不可用时**只发一条
+       UserWarning 就退回 basic**，不抛错——不主动 check 会以为整形生效了；
+    2. Raqm 在**运行时**才去加载 C 库，形态随 wheel 而变：有的把 raqm 静态
+       编进去、只差 ``fribidi``（Windows ``fribidi-0.dll`` / Linux
+       ``libfribidi.so.0``）；有的动态链接 ``libraqm``（本机实测 Pillow 13
+       的 win_amd64 wheel 导入表里两者都有）。缺任何一个 check 都是 False，
+       而精简镜像恰好两样都没装。
+    """
+    global _RAQM_AVAILABLE
+    if _RAQM_AVAILABLE is None:
+        try:
+            from PIL import features
+
+            _RAQM_AVAILABLE = bool(features.check("raqm"))
+        except Exception:  # noqa: BLE001
+            _RAQM_AVAILABLE = False
+    return _RAQM_AVAILABLE

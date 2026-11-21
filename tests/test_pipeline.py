@@ -455,5 +455,60 @@ class MissingGlyphWarningTest(unittest.TestCase):
         return buf.tobytes()
 
 
+class MissingShapingWarningTest(unittest.TestCase):
+    """缺整形（Raqm）时也必须抬警告——图上"有字"，但排列是错的。
+
+    与缺字形是两种事故：缺字形画方框，一眼能看出；缺整形时孟加拉文的
+    元音符号站错边、辅音连字被拆开、阿拉伯文整行反过来，接口照样 200，
+    只有懂这门语言的人能发现。不能让它安静地过去。
+    """
+
+    def test_warning_when_raqm_unavailable(self) -> None:
+        from unittest import mock
+
+        import imgtrans.render.fonts as fonts_mod
+
+        blocks = [_block(0, "测试文字", 20, 20, 140, 40)]
+        translator = RecordingTranslator({"测试文字": "বাংলা"})
+        with mock.patch.object(fonts_mod, "_RAQM_AVAILABLE", False):
+            pipeline = ImageTranslatePipeline(
+                translator, ocr=FakeOcr(blocks), config=PipelineConfig()
+            )
+            result = pipeline.translate_bytes(self._png(), "bn")
+
+        self.assertTrue(
+            any("整形" in w for w in result.warnings),
+            f"缺整形要抬到响应 warnings，实际 {result.warnings}",
+        )
+
+    def test_no_shaping_warning_for_non_shaping_language(self) -> None:
+        """英语不需要整形，装没装 Raqm 都不该报。"""
+        from unittest import mock
+
+        import imgtrans.render.fonts as fonts_mod
+
+        blocks = [_block(0, "测试文字", 20, 20, 140, 40)]
+        translator = RecordingTranslator({"测试文字": "Hello there"})
+        with mock.patch.object(fonts_mod, "_RAQM_AVAILABLE", False):
+            pipeline = ImageTranslatePipeline(
+                translator, ocr=FakeOcr(blocks), config=PipelineConfig()
+            )
+            result = pipeline.translate_bytes(self._png(), "en")
+
+        self.assertFalse(
+            any("整形" in w for w in result.warnings),
+            f"en 不该出现整形警告，实际 {result.warnings}",
+        )
+
+    def _png(self) -> bytes:
+        import cv2
+
+        img = np.full((120, 220, 3), 245, dtype=np.uint8)
+        img[20:60, 20:160] = (20, 20, 24)
+        ok, buf = cv2.imencode(".png", img)
+        self.assertTrue(ok)
+        return buf.tobytes()
+
+
 if __name__ == "__main__":
     unittest.main()

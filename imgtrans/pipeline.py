@@ -35,7 +35,7 @@ from .inpaint.erase import erase_text, polish_residuals
 from .inpaint.mask import BoxAnalysis, analyze_box
 from .ocr.engine import OcrEngine, resolve_ocr_lang
 from .ocr.group import group_blocks, join_row_fragments
-from .render.fonts import FontBook, font_dirs_from_env
+from .render.fonts import FontBook, font_dirs_from_env, has_raqm, needs_shaping
 from .render.style import analyze_style
 from .render.text import render_blocks
 from .translator import target_unavailable_reason
@@ -492,6 +492,16 @@ class ImageTranslatePipeline:
                 warnings.append(
                     "字体缺少部分译文用到的字形，这些字被画成了方框；"
                     "安装对应字体后重启即可（Linux: apt install fonts-noto-core）"
+                )
+            # 与缺字形是两回事：字都在，但排列是错的。孟加拉/天城/泰文的元音
+            # 符号要重排、辅音要连字，阿拉伯/希伯来要从右往左——这些只有
+            # Raqm 能做。缺 Raqm 时图上照样有字，肉眼不容易判断"对不对"，
+            # 所以必须在响应里说清楚，否则会被当成翻译质量问题去查翻译。
+            if needs_shaping(target_lang) and not has_raqm():
+                warnings.append(
+                    f"目标语言 {target_lang} 需要文本整形，但当前 Pillow 没有 Raqm："
+                    "元音符号位置、辅音连字与 RTL 顺序都会不正确（字形本身不缺）；"
+                    "Linux 安装 libraqm0 libfribidi0 后重启服务即可"
                 )
         timings["render"] = (time.perf_counter() - t0) * 1000
 
