@@ -107,6 +107,13 @@ def main() -> int:
         default=0.45,
         help="行内碎片拼接的水平间隙上限（相对行高）。0 关闭；参数表密集的图可调到 0.2",
     )
+    parser.add_argument(
+        "--no-erase-residuals",
+        action="store_true",
+        default=(os.environ.get("IMGTRANS_ERASE_RESIDUALS", "").strip().lower()
+                 in ("0", "false", "no", "off")),
+        help="关闭擦除后的残墨复检（默认开启；出问题时用来对照）",
+    )
     args = parser.parse_args()
 
     if args.dev:
@@ -236,6 +243,7 @@ def main() -> int:
                 ocr_profile=ocr_profile,
                 ocr_det_side_len=args.ocr_det_side_len,
                 row_join_gap_ratio=args.row_join_gap,
+                erase_residuals=not args.no_erase_residuals,
             ),
         )
         # 预热交给 app 的 startup 钩子统一做：两处都调的话 --no-warmup

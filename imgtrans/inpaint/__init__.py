@@ -5,6 +5,7 @@ from .erase import (
     GRADIENT_STD,
     INPAINT_RADIUS,
     erase_text,
+    polish_residuals,
 )
 from .mask import (
     DILATE_PX,
@@ -28,4 +29,5 @@ __all__ = [
     "build_text_mask",
     "erase_text",
     "estimate_bg_color",
+    "polish_residuals",
 ]

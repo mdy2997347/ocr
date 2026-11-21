@@ -31,7 +31,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .downloader import fetch_image
-from .inpaint.erase import erase_text
+from .inpaint.erase import erase_text, polish_residuals
 from .inpaint.mask import BoxAnalysis, analyze_box
 from .ocr.engine import OcrEngine, resolve_ocr_lang
 from .ocr.group import group_blocks, join_row_fragments
@@ -120,6 +120,12 @@ class PipelineConfig:
     render: bool = True
     #: 是否擦除原文（False 时返回原图，仅做 OCR + 翻译，用于调试）
     erase: bool = True
+    #: 擦除后是否复检框边残墨（默认开启，见 :func:`imgtrans.inpaint.erase.polish_residuals`）。
+    #:
+    #: OCR 框贴字形，字形偶尔溢出框 1~2px（右括号、中文标点），
+    #: ``MASK_PAD_*`` 猜不出具体是几像素；复检直接量"框边还有没有和背景
+    #: 差得远的像素"，把漏掉的笔画补掉。关掉只在排错时用。
+    erase_residuals: bool = True
     #: 超大图像素数阈值，超过仅告警（分块处理尚未实现）
     big_image_pixels: int = 4000 * 4000
     #: 字体目录（生产建议显式配置）
@@ -449,6 +455,12 @@ class ImageTranslatePipeline:
                 region = mask[y0:y1, x0:x1]
                 np.maximum(region, analysis.mask, out=region)
             base = erase_text(image_bgr, mask, erase_analyses)
+            if self._config.erase_residuals:
+                # 擦完再量一遍框边：字形溢出 OCR 框 1~2px 时 mask 根本没盖到，
+                # 放大后是一道黑线（实测右括号残留 1x13px）。这里按"与框外
+                # 背景色的差"补，不依赖 MASK_PAD_* 猜得多准。
+                # 只写日志不进 warnings：补上残墨是正常收尾，不是异常。
+                base, _patched = polish_residuals(base, erase_analyses)
             timings["erase"] = (time.perf_counter() - t0) * 1000
 
         # --- 样式 + 回填 ---

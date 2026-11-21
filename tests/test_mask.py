@@ -664,5 +664,72 @@ class EraseCleanlinessTest(unittest.TestCase):
         self.assertEqual(dirty, 0, f"竖排仍有 {dirty} 个像素残留")
 
 
+class ResidualPolishTest(unittest.TestCase):
+    """擦除复检：补掉框边漏擦的笔画，但只补"确实是漏掉的笔画"。
+
+    为什么需要这一步：OCR 框紧贴字形，字形偶尔溢出框 1~2px（右括号、中文
+    标点最常见）。mask 只在框内生成，溢出那几列永远擦不到，放大后是一条
+    黑线；而把 ``MASK_PAD_RIGHT`` 调大只是拿一张图拟合，换张图就会啃到邻图。
+    """
+
+    def _erase_and_polish(self, img, block):
+        from imgtrans.inpaint.erase import erase_text, polish_residuals
+        from imgtrans.inpaint.mask import analyze_box
+
+        bgr = _to_bgr(img)
+        a = analyze_box(bgr, block)
+        h, w = bgr.shape[:2]
+        mask = np.zeros((h, w), np.uint8)
+        x0, y0, x1, y1 = a.box
+        np.maximum(mask[y0:y1, x0:x1], a.mask, out=mask[y0:y1, x0:x1])
+        base = erase_text(bgr, mask, [a])
+        out, patched = polish_residuals(base, [a])
+        return base, out, patched
+
+    def test_sliver_outside_box_is_removed(self) -> None:
+        img = Image.new("RGB", (260, 100), (250, 250, 252))
+        full = _text_block(img, (30, 25), "测试文字", 30, (20, 20, 24))
+        x0, y0, x1, y1 = full.box
+        # 框比墨迹窄 2px，模拟 PaddleOCR 把字形的右缘截在框外
+        block = TextBlock(
+            index=0,
+            polygon=((x0, y0), (x1 - 2, y0), (x1 - 2, y1), (x0, y1)),
+            text=full.text,
+            confidence=0.99,
+        )
+        base, out, patched = self._erase_and_polish(img, block)
+
+        def dark(arr) -> int:
+            return int((arr[y0:y1 + 1, x1 - 8:x1 + 6].max(axis=2) < 200).sum())
+
+        self.assertGreater(dark(base), 0, "构造有误：这一步本来就该留下残墨")
+        self.assertEqual(dark(out), 0, f"仍有 {dark(out)} 个残墨像素没被补掉")
+        self.assertGreater(patched, 0)
+
+    def test_thin_rule_is_not_eaten(self) -> None:
+        """紧贴框的细线（表格竖线、边框）是内容，不是残墨，必须保住。"""
+        img = Image.new("RGB", (300, 140), (250, 250, 252))
+        block = _text_block(img, (40, 30), "参数", 30, (20, 20, 24))
+        x0, y0, x1, y1 = block.box
+        rule_x = x1 + 2  # 落在擦除外扩(1px)之外、复检环(3px)之内
+        draw = ImageDraw.Draw(img)
+        draw.line([(rule_x, 10), (rule_x, 120)], fill=(110, 110, 116), width=1)
+
+        _, out, _ = self._erase_and_polish(img, block)
+        col = out[10:121, rule_x].max(axis=1)
+        self.assertGreater(
+            int((col < 160).sum()),
+            100,
+            "细线被当成残墨补掉了",
+        )
+
+    def test_nothing_to_fix_keeps_image(self) -> None:
+        img = Image.new("RGB", (240, 90), (250, 250, 252))
+        block = _text_block(img, (40, 25), "参数", 30, (20, 20, 24))
+        base, out, patched = self._erase_and_polish(img, block)
+        self.assertEqual(patched, 0, "干净的框不该被补像素")
+        self.assertTrue(np.array_equal(base, out))
+
+
 if __name__ == "__main__":
     unittest.main()

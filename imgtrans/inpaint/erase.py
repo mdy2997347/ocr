@@ -342,3 +342,117 @@ def erase_text(
     alpha3 = alpha[:, :, None]
     out = image_bgr.astype(np.float32) * (1.0 - alpha3) + filled.astype(np.float32) * alpha3
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+#: 擦除后复检时，在框外多看的像素数。
+#:
+#: 复检要解决的是"MASK_PAD_* 猜不准"这件事：PaddleOCR 的框贴着字形，
+#: 但字形偶尔会溢出框 1~2px（中文标点、带弧度的右括号尤其常见）。
+#: 实测商品参数图里 ``(不可水洗)`` 的右括号有 1px 竖条落在框外，
+#: 擦完留下一道 13px 高的黑线——调大 MASK_PAD_RIGHT 能盖住这一张，
+#: 换一张又会把邻图的边缘啃掉。所以改成擦完再量一次。
+RESIDUAL_RING = 3
+
+#: 复检判定"这里还是字"的最小对比度（通道最大差）。
+#:
+#: 比 mask 里的 :data:`~imgtrans.inpaint.mask.MIN_CONTRAST`(15) 严，
+#: 因为这一步是在框外作业：界线附近常有邻图的抗锯齿、JPEG 振铃，
+#: 宁可漏掉极淡的残影（肉眼不可见），也不要啃到旁边的元素。
+RESIDUAL_CONTRAST = 24
+
+#: 复检时允许修补的最大连通域面积（像素）。
+#:
+#: 残墨是碎条，邻图是成片的。超过这个面积说明"这不是漏掉的一笔"，
+#: 而是背景估计出了问题或者框边紧贴着别的图形——两种情况都不该动。
+RESIDUAL_MAX_AREA = 600
+
+
+def _frame_pixels(roi: np.ndarray, width: int) -> np.ndarray:
+    """取 ROI 最外一圈像素（``(N, 3)``），用于估计"这里本该是什么颜色"。"""
+    h, w = roi.shape[:2]
+    if h <= 2 * width or w <= 2 * width:
+        return roi.reshape(-1, 3)
+    return np.concatenate(
+        [
+            roi[:width, :, :].reshape(-1, 3),
+            roi[-width:, :, :].reshape(-1, 3),
+            roi[:, :width, :].reshape(-1, 3),
+            roi[:, -width:, :].reshape(-1, 3),
+        ]
+    )
+
+
+def polish_residuals(
+    image_bgr: np.ndarray,
+    analyses: list[BoxAnalysis],
+    *,
+    ring: int = RESIDUAL_RING,
+    contrast: int = RESIDUAL_CONTRAST,
+    max_area: int = RESIDUAL_MAX_AREA,
+) -> tuple[np.ndarray, int]:
+    """擦除之后，把框边漏掉的笔画补掉。
+
+    判据不是"再多擦几个像素"，而是**量**：框外一圈的颜色是现成的背景真值，
+    框内框边若还有像素与它差得远，那就是没擦干净的笔画。这样处理与
+    ``MASK_PAD_*`` 猜多大无关，也不会因为外扩而啃掉邻图的边缘——只有
+    "确实与周围背景不一致"的碎块才会被补。
+
+    刻意排除两类连通域：
+
+    * **细长的整条线**（表格分隔线、边框）——它们是内容，不是残墨；
+    * **成片的区域**（面积超过 ``max_area``）——那是背景估计跑偏了。
+
+    Returns:
+        ``(处理后的图, 被补掉的像素数)``。像素数为 0 表示没有残墨，
+        调用方可据此决定要不要打日志。
+    """
+    h, w = image_bgr.shape[:2]
+    out = image_bgr.copy()
+    patched_total = 0
+
+    for analysis in analyses:
+        x0, y0, x1, y1 = analysis.box
+        if x1 <= x0 or y1 <= y0:
+            continue
+        gx0, gy0 = max(0, x0 - ring), max(0, y0 - ring)
+        gx1, gy1 = min(w, x1 + ring), min(h, y1 + ring)
+        roi = out[gy0:gy1, gx0:gx1]
+        if roi.size == 0 or roi.shape[0] < 3 or roi.shape[1] < 3:
+            continue
+
+        bg = np.median(_frame_pixels(roi, ring), axis=0)
+        diff = np.max(np.abs(roi.astype(np.int16) - bg.astype(np.int16)), axis=2)
+        cand = diff >= contrast
+        if not cand.any():
+            continue
+
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(
+            cand.astype(np.uint8), 8
+        )
+        roi_h, roi_w = roi.shape[:2]
+        keep = np.zeros((roi_h, roi_w), dtype=np.uint8)
+        for i in range(1, n):
+            cx, cy, cw, ch, area = stats[i]
+            if area > max_area:
+                continue
+            # 横贯或纵贯整块 ROI 的细线：那是分隔线/边框，属于内容
+            if cw >= 0.8 * roi_w and ch <= 2:
+                continue
+            if ch >= 0.8 * roi_h and cw <= 2:
+                continue
+            keep[labels == i] = 1
+        if not keep.any():
+            continue
+
+        # 膨胀 1px 把残墨的抗锯齿边一起补掉，否则补完还是能看到一圈灰
+        keep = cv2.dilate(keep, np.ones((3, 3), np.uint8), iterations=1)
+        try:
+            filled = cv2.inpaint(roi, keep * 255, 3, cv2.INPAINT_TELEA)
+        except cv2.error:  # noqa: BLE001
+            continue
+        roi[keep > 0] = filled[keep > 0]
+        patched_total += int((keep > 0).sum())
+
+    if patched_total:
+        logger.info("擦除复检: 补掉 %d 个残余笔画像素", patched_total)
+    return out, patched_total
