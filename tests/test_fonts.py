@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 import imgtrans.render.fonts as fonts
-from imgtrans.render.fonts import FontBook, font_dirs_from_env
+from imgtrans.render.fonts import FontBook, family_for_lang, font_dirs_from_env
 
 
 class _TempFontTree:
@@ -201,6 +201,144 @@ class SystemFontDirsTest(unittest.TestCase):
         dirs = fonts._SYSTEM_FONT_DIRS
         if not sys.platform.startswith("win"):
             self.assertFalse(any(d.startswith("C:") for d in dirs))
+
+
+def _first_font_covering(sample: str) -> Path | None:
+    """在本机真实字体里找一个能画出 ``sample`` 的字体文件（没有则跳过用例）。
+
+    用字体自己的 cmap 判断，而不是写死文件名——CI 上装的是 Noto，开发机是
+    Sylfaen，判据必须落在"有没有这个字形"上。
+    """
+    book = FontBook()
+    for path in dict.fromkeys(book.index.values()):
+        cps = book.codepoints(path)
+        if cps and all(ord(ch) in cps for ch in sample):
+            return path
+    return None
+
+
+def _first_font_lacking(sample: str) -> Path | None:
+    """在本机找一个**画不出** ``sample`` 的字体（用来构造"缺字形"场景）。"""
+    book = FontBook()
+    for path in dict.fromkeys(book.index.values()):
+        cps = book.codepoints(path)
+        if cps and any(ord(ch) not in cps for ch in sample):
+            return path
+    return None
+
+
+#: 格鲁吉亚文 "გამარჯობა"：中文/拉丁字体普遍没有这套字形，正好当探针。
+GEO = "გამარჯობა"
+
+
+class CmapCoverageTest(unittest.TestCase):
+    """字形覆盖必须真的从字体里读出来，不能靠文件名猜。"""
+
+    def test_reader_rejects_non_font_bytes(self) -> None:
+        self.assertIsNone(fonts._cmap_codepoints(b"not a font at all"))
+        self.assertIsNone(fonts._cmap_codepoints(b""))
+
+    def test_reader_returns_real_codepoints(self) -> None:
+        path = _first_font_covering("abc")
+        if path is None:
+            self.skipTest("本机没有可解析的字体")
+        cps = fonts._cmap_codepoints(path.read_bytes())
+        self.assertIsNotNone(cps)
+        assert cps is not None
+        for ch in "abc":
+            self.assertIn(ord(ch), cps, f"{path.name} 缺 {ch!r}")
+        # 中文字体两万多个码位，能读出来就不会只有几十个
+        self.assertGreater(len(cps), 50)
+
+    def test_ttc_face_is_read(self) -> None:
+        """ttc 要按 face 偏移解析，不能把整个容器当裸 sfnt。"""
+        book = FontBook()
+        ttcs = [p for p in book.index.values() if p.suffix.lower() in (".ttc", ".otc")]
+        if not ttcs:
+            self.skipTest("本机没有 .ttc 字体")
+        cps = book.codepoints(ttcs[0])
+        self.assertIsNotNone(cps)
+        assert cps is not None
+        self.assertGreater(len(cps), 50)
+
+
+class ResolveFamilyTest(unittest.TestCase):
+    """按**实际文字**选族：语言码只是猜测，覆盖才是事实。"""
+
+    def _book_with(self, font: Path, name: str) -> FontBook:
+        root = Path(tempfile.mkdtemp(prefix="imgtrans_one_font_"))
+        self.addCleanup(shutil.rmtree, root, True)
+        shutil.copy(font, root / name)
+        with mock.patch.object(fonts, "_SYSTEM_FONT_DIRS", (str(root),)):
+            book = FontBook()
+            _ = book.index
+            return book
+
+    def test_keeps_own_family_when_covered(self) -> None:
+        geo = _first_font_covering(GEO)
+        if geo is None:
+            self.skipTest("本机没有能画格鲁吉亚文的字体")
+        book = self._book_with(geo, "sylfaen.ttf")
+        self.assertEqual(book.resolve_family("ka", GEO), "georgian")
+        self.assertEqual(book.missing_chars("ka", GEO), "")
+
+    def test_switches_to_family_that_can_draw_it(self) -> None:
+        """本族缺失、但别的族能画 -> 换族，而不是照旧画方框。
+
+        构造：把能画格鲁吉亚文的字体只命名成 latin 族的候选文件名。
+        """
+        geo = _first_font_covering(GEO)
+        if geo is None:
+            self.skipTest("本机没有能画格鲁吉亚文的字体")
+        book = self._book_with(geo, "arial.ttf")
+        self.assertEqual(book.resolve_family("ka", GEO), "latin")
+        self.assertEqual(book.missing_chars("latin", GEO), "")
+
+    def test_reports_missing_when_nothing_covers(self) -> None:
+        """谁都画不出来时必须说清楚缺哪些字（这正是用户看到方框的场景）。"""
+        cjk = _first_font_lacking(GEO)
+        if cjk is None:
+            self.skipTest("本机没有缺格鲁吉亚字形的字体")
+        book = self._book_with(cjk, cjk.name)
+        with self.assertLogs("imgtrans.render.fonts", level="ERROR") as logs:
+            book.resolve_family("ka", GEO)
+        joined = "\n".join(logs.output)
+        self.assertIn("没有任何字体覆盖", joined)
+        missing = book.missing_chars("ka", GEO)
+        self.assertTrue(missing, "缺字形时 missing_chars 不能返回空")
+        self.assertTrue(set(missing) & set(GEO))
+
+    def test_check_langs_flags_undrawable_language(self) -> None:
+        cjk = _first_font_lacking(GEO)
+        if cjk is None:
+            self.skipTest("本机没有缺格鲁吉亚字形的字体")
+        book = self._book_with(cjk, cjk.name)
+        with self.assertLogs("imgtrans.render.fonts", level="ERROR"):
+            problems = book.check_langs(["ka"])
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("ka"))
+        self.assertIn("没有字体能画", problems[0])
+
+    def test_check_langs_quiet_when_everything_covered(self) -> None:
+        geo = _first_font_covering(GEO + "abc")
+        if geo is None:
+            self.skipTest("本机没有能画格鲁吉亚文的字体")
+        book = self._book_with(geo, "arial.ttf")
+        self.assertEqual(book.check_langs(["en", "ka"]), [])
+
+
+class FamilyKeyPassthroughTest(unittest.TestCase):
+    def test_family_name_is_not_remapped(self) -> None:
+        """``resolve_family`` 选出的族名要能直接喂回 ``get_font``。
+
+        否则 ``georgian`` 会被当成未知语言码再映射回 ``cjk``，等于白选。
+        """
+        for family in fonts.FONT_CANDIDATES:
+            self.assertEqual(family_for_lang(family), family)
+        # 语言码仍然按原表映射
+        self.assertEqual(family_for_lang("ka"), "georgian")
+        self.assertEqual(family_for_lang("zh"), "cjk")
+        self.assertEqual(family_for_lang(None), "cjk")
 
 
 if __name__ == "__main__":

@@ -177,6 +177,11 @@ class ImageTranslatePipeline:
         return self._config
 
     @property
+    def font_book(self) -> FontBook:
+        """字体库。启动自检要问它"本机到底能不能画出这些文字"。"""
+        return self._font_book
+
+    @property
     def device(self) -> str:
         """实际生效的推理设备（已归一化），用于启动日志与健康检查。"""
         return self._ocr.device
@@ -480,6 +485,14 @@ class ImageTranslatePipeline:
                 self._font_book,
                 target_lang,
             )
+            # 字体缺字形时图上是一排方框，肉眼只会觉得"翻译坏了"。渲染层已经把
+            # 缺的字写进块报告的 note，这里再抬一条整个响应的 warning：调用方
+            # 不必逐块翻报告就能知道该去装字体。
+            if any("字体缺字形" in r.note for r in reports):
+                warnings.append(
+                    "字体缺少部分译文用到的字形，这些字被画成了方框；"
+                    "安装对应字体后重启即可（Linux: apt install fonts-noto-core）"
+                )
         timings["render"] = (time.perf_counter() - t0) * 1000
 
         # --- 输出 ---

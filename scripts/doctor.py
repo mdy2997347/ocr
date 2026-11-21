@@ -154,22 +154,26 @@ def check_fonts(r: Report) -> None:
             continue
 
         family = F.family_for_lang(lang)
-        dedicated = {c.lower() for c in F.FONT_CANDIDATES.get(family, ())}
-        hit = path.name.lower()
+        probe = F.FONT_PROBE_TEXT.get(family, "")
+        # 判据从"文件名对不对"改成"这些字到底画不画得出来"：
+        # 文件名猜不出覆盖。ka 就是活例子——文件名叫 DejaVuSans 也算"专用"，
+        # 但如果那台机器装的是个没格鲁吉亚字形的版本，照样一片方框。
+        resolved = book.resolve_family(lang, probe) if probe else family
+        missing = book.missing_chars(resolved, probe) if probe else ""
 
-        if hit in dedicated:
-            r.ok(f"字体 {lang}", f"{path.name}（{family} 专用）")
-        elif family in F._LATIN_FALLBACK_LACKS and hit in {
-            c.lower() for c in F.FONT_CANDIDATES["latin"]
-        }:
-            # 回退到拉丁字体：中文/泰文/天城文必然豆腐块
+        if missing:
             r.fail(
                 f"字体 {lang}",
-                f"回退到 {path.name}，缺 {family} 字形 → 会画成豆腐块(□)。"
-                "Linux 装 fonts-noto-cjk / fonts-noto-core",
+                f"缺字形：{missing} 画不出来 → 会变成方框(□)。"
+                "Linux 装 fonts-noto-core（含格鲁吉亚/泰/天城/孟加拉）或对应语种字体",
+            )
+        elif resolved != family:
+            r.warn(
+                f"字体 {lang}",
+                f"本族（{family}）字体缺失，改用 {resolved} 绘制（能画出来，字形风格可能不一致）",
             )
         else:
-            r.warn(f"字体 {lang}", f"回退到 {path.name}（字形可能不理想）")
+            r.ok(f"字体 {lang}", f"{path.name}（{family}）")
 
 
 def check_device(r: Report) -> None:

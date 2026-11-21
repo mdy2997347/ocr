@@ -1258,6 +1258,15 @@ def render_blocks(
     canvas = image_bgr.copy()
     reports: list[RenderedBlock] = []
 
+    # 语言码只是"猜"字体族，能不能真画出来取决于字形覆盖。猜错时 Pillow 不会
+    # 抛异常，只把不认识的码位全画成一模一样的 □（缺格鲁吉亚字体时整段
+    # 格鲁吉亚文就是九个小方框），日志里也只有一句"字形可能不理想"。所以这里
+    # 拿译文实际用到的字符核对一遍：能换族就换，换不了就把缺的字带回块报告。
+    sample = " ".join(t for t in translations if t)
+    family = font_book.resolve_family(lang, sample)
+    missing = font_book.missing_chars(family, sample)
+    lang = family  # 同一个值继续往下传；下游只用它取字体
+
     # 边缘图只算一次：扩框判断要靠它，逐块算会重复付出 Canny 的代价。
     # 必须在**擦除之后**的图上算（这里 image_bgr 就是擦除后的底图），
     # 否则本块原文的边缘会把自己挡住。
@@ -1424,5 +1433,13 @@ def render_blocks(
                 fit_mode=layout.fit_mode,
             )
         )
+
+    if missing:
+        # 缺字形不是致命错误（图还是能出），但必须让调用方看见：
+        # 只写日志的话，面板上只会看到"译文是一排方框"，没人知道去哪查。
+        note = f"字体缺字形，这些字被画成了方框：{missing}"
+        for report, target in zip(reports, translations):
+            if report.painted and any(ch in missing for ch in (target or "")):
+                report.note = f"{report.note}；{note}" if report.note else note
 
     return canvas, reports

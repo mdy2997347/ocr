@@ -392,5 +392,68 @@ class RowJoinWiringTest(unittest.TestCase):
         self.assertEqual(translator.calls[0], ["说明：系统价格默认304材质，", "如需316材质请"])
 
 
+class MissingGlyphWarningTest(unittest.TestCase):
+    """字体缺字形时，响应里必须说出来，而不是只把字画成一排方框。
+
+    真实事故（2026-11）：只装了中文字体的机器上翻成格鲁吉亚语（ka），
+    Pillow 把每个字母都画成同一个 □，接口照样返回 200，日志里只有一句
+    "字形可能不理想"。用户只能看到"乱码"，无从判断是翻译坏了还是缺字体。
+    """
+
+    GEO = "გამარჯობა"
+
+    def _pipeline_with_only(self, font_name: str):
+        """只用一台"只有这个字体"的机器，跑完整链路。"""
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        import imgtrans.render.fonts as fonts_mod
+
+        book = fonts_mod.FontBook()
+        source = book.find("zh") or book.find("en")
+        if source is None:
+            self.skipTest("本机一个字体都没有")
+        root = Path(tempfile.mkdtemp(prefix="imgtrans_noglyph_"))
+        self.addCleanup(shutil.rmtree, root, True)
+        shutil.copy(source, root / font_name)
+        patcher = mock.patch.object(fonts_mod, "_SYSTEM_FONT_DIRS", (str(root),))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        blocks = [_block(0, "测试文字", 20, 20, 140, 40)]
+        translator = RecordingTranslator({"测试文字": self.GEO})
+        return ImageTranslatePipeline(
+            translator,
+            ocr=FakeOcr(blocks),
+            config=PipelineConfig(font_dirs=(str(root),)),
+        )
+
+    def test_warning_and_block_note_when_glyphs_missing(self) -> None:
+        pipeline = self._pipeline_with_only("NotoSansCJK-Regular.ttc")
+        # 先确认构造真的缺字形（否则这条用例证明不了什么）
+        if not pipeline.font_book.missing_chars("ka", self.GEO):
+            self.skipTest("本机的中文字体居然带格鲁吉亚字形，无法构造该场景")
+
+        result = pipeline.translate_bytes(self._png(), "ka")
+
+        self.assertTrue(
+            any("字形" in w and "方框" in w for w in result.warnings),
+            f"缺字形要抬到响应 warnings，实际 {result.warnings}",
+        )
+        notes = [b.note for b in result.blocks if "方框" in b.note]
+        self.assertTrue(notes, f"块报告里要写明哪些字被画成方框，实际 {[b.note for b in result.blocks]}")
+
+    def _png(self) -> bytes:
+        import cv2
+
+        img = np.full((120, 220, 3), 245, dtype=np.uint8)
+        img[20:60, 20:160] = (20, 20, 24)
+        ok, buf = cv2.imencode(".png", img)
+        self.assertTrue(ok)
+        return buf.tobytes()
+
+
 if __name__ == "__main__":
     unittest.main()

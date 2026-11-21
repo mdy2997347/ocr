@@ -21,7 +21,7 @@ import re
 import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from PIL import ImageFont
 
@@ -282,11 +282,39 @@ _LANG_TO_FAMILY: dict[str, str] = {
 }
 
 
+#: 各族用来"自检本机字体能不能画这种文字"的样例。
+#:
+#: 部署自检（:meth:`FontBook.check_langs`）拿它当探针：语言码能映射到族，
+#: 不代表本机真有能画出这些字的字体——这正是 ka 在只装了中文字体的机器上
+#: 变成一排方框的原因。样例只取各文字的代表字，不做可信度评估。
+FONT_PROBE_TEXT: dict[str, str] = {
+    "cjk": "中文测试",
+    "ja": "日本語のテスト",
+    "ko": "한국어 테스트",
+    "ar": "اختبار",
+    "th": "ทดสอบ",
+    "devanagari": "परीक्षण",
+    "bengali": "পরীক্ষা",
+    "georgian": "გამარჯობა",
+    "latin": "Test 123",
+}
+
+
 def family_for_lang(lang: str | None) -> str:
-    """把目标语言码映射到字体族名。"""
+    """把目标语言码映射到字体族名。
+
+    也接受**已经是族名**的输入（``georgian`` / ``latin`` / ``cjk``…）：
+    :meth:`FontBook.resolve_family` 会把"按字形覆盖选出来的族"继续传给
+    :meth:`FontBook.get_font`，这里必须原样透传，否则 ``georgian`` 会被
+    当成未知语言码再映射回 ``cjk``，等于白选。
+    ``ja`` / ``ko`` / ``ar`` / ``th`` 既是语言码又是族名，且映射到自身，无歧义。
+    """
     if not lang:
         return "cjk"
-    return _LANG_TO_FAMILY.get(lang.lower(), "cjk")
+    key = lang.lower()
+    if key in FONT_CANDIDATES:
+        return key
+    return _LANG_TO_FAMILY.get(key, "cjk")
 
 
 #: 回退到 **latin 家族**字体时，这些目标族必定缺字形（直接画成 □）。
@@ -313,6 +341,144 @@ _FACE_TOKENS: dict[str, frozenset[str]] = {
 #: ttc 里最多探测多少个 face（Noto CJK 是 5 个，16 足够且不会在坏字体上空转）。
 _MAX_FACE_PROBE = 16
 
+#: 读 cmap 时最多看多少个子表（真实字体 1~3 个，留余量只为防坏文件空转）。
+_MAX_CMAP_SUBTABLES = 8
+
+#: 报告"缺字形"时最多列几个字（日志和块报告都不该被一长串汉字撑爆）。
+_MAX_MISSING_REPORT = 24
+
+
+def _sfnt_tables(data: bytes, face_index: int = 0) -> dict[bytes, tuple[int, int]] | None:
+    """读 sfnt 表目录，返回 ``tag -> (offset, length)``。
+
+    同时支持裸 TTF/OTF 与 TTC/OTC（``ttcf`` 头 + face 偏移表）。解析失败返回
+    ``None``——**不抛异常**：字体文件可能是空占位、截断文件或另一种容器，
+    这条路径的原则是"读不出就当不知道"，而不是让整张图生成失败。
+    """
+    if len(data) < 12:
+        return None
+    if data[:4] == b"ttcf":
+        entry = 12 + 4 * face_index
+        if len(data) < entry + 4:
+            return None
+        base = int.from_bytes(data[entry : entry + 4], "big")
+    else:
+        base = 0
+    if len(data) < base + 12:
+        return None
+    num = int.from_bytes(data[base + 4 : base + 6], "big")
+    if num <= 0 or num > 512:
+        return None
+    tables: dict[bytes, tuple[int, int]] = {}
+    for i in range(num):
+        rec = base + 12 + 16 * i
+        if len(data) < rec + 16:
+            return None
+        tables[data[rec : rec + 4]] = (
+            int.from_bytes(data[rec + 8 : rec + 12], "big"),
+            int.from_bytes(data[rec + 12 : rec + 16], "big"),
+        )
+    return tables
+
+
+def _cmap_format4(data: bytes, off: int) -> frozenset[int]:
+    """format 4：BMP 的段式映射，绝大多数中文字体用它。"""
+    seg2 = int.from_bytes(data[off + 6 : off + 8], "big")
+    seg = seg2 // 2
+    if seg <= 0:
+        return frozenset()
+    ends_at = off + 14
+    starts_at = ends_at + seg2 + 2  # 跳过 reservedPad
+    deltas_at = starts_at + seg2
+    ranges_at = deltas_at + seg2
+    if len(data) < ranges_at + seg2:
+        return frozenset()
+    cps: set[int] = set()
+    for i in range(seg):
+        end = int.from_bytes(data[ends_at + 2 * i : ends_at + 2 * i + 2], "big")
+        start = int.from_bytes(data[starts_at + 2 * i : starts_at + 2 * i + 2], "big")
+        delta = int.from_bytes(
+            data[deltas_at + 2 * i : deltas_at + 2 * i + 2], "big", signed=True
+        )
+        range_offset = int.from_bytes(data[ranges_at + 2 * i : ranges_at + 2 * i + 2], "big")
+        if start > end:
+            continue
+        if range_offset == 0:
+            # 整段按 delta 平移，没有逐字表
+            for cp in range(start, end + 1):
+                if (cp + delta) & 0xFFFF:
+                    cps.add(cp)
+            continue
+        for cp in range(start, end + 1):
+            addr = ranges_at + 2 * i + range_offset + 2 * (cp - start)
+            if addr + 2 > len(data):
+                break
+            gid = int.from_bytes(data[addr : addr + 2], "big")
+            if gid and ((gid + delta) & 0xFFFF):
+                cps.add(cp)
+    return frozenset(cps)
+
+
+def _cmap_format12(data: bytes, off: int) -> frozenset[int]:
+    """format 12：分组式，能表达 BMP 之外的字符（Noto 系列常用）。"""
+    groups = int.from_bytes(data[off + 12 : off + 16], "big")
+    cps: set[int] = set()
+    for i in range(min(groups, 200_000)):
+        rec = off + 16 + 12 * i
+        if len(data) < rec + 12:
+            break
+        start = int.from_bytes(data[rec : rec + 4], "big")
+        end = int.from_bytes(data[rec + 4 : rec + 8], "big")
+        gid = int.from_bytes(data[rec + 8 : rec + 12], "big")
+        if end < start or start > 0x10FFFF:
+            continue
+        for cp in range(start, min(end, 0x10FFFF) + 1):
+            if gid + (cp - start):
+                cps.add(cp)
+    return frozenset(cps)
+
+
+def _cmap_codepoints(data: bytes, face_index: int = 0) -> frozenset[int] | None:
+    """读字体 cmap，返回它真正有字形的码位集合。读不出返回 ``None``。"""
+    tables = _sfnt_tables(data, face_index)
+    if not tables or b"cmap" not in tables:
+        return None
+    cmap_off = tables[b"cmap"][0]
+    if len(data) < cmap_off + 4:
+        return None
+
+    count = int.from_bytes(data[cmap_off + 2 : cmap_off + 4], "big")
+    best_rank = 0
+    best_off: int | None = None
+    for i in range(min(count, _MAX_CMAP_SUBTABLES)):
+        rec = cmap_off + 4 + 8 * i
+        if len(data) < rec + 8:
+            break
+        platform = int.from_bytes(data[rec : rec + 2], "big")
+        encoding = int.from_bytes(data[rec + 2 : rec + 4], "big")
+        sub = cmap_off + int.from_bytes(data[rec + 4 : rec + 8], "big")
+        # 优先级：Unicode 全平面(3,10) > Unicode(0,*) > BMP(3,1)
+        if (platform, encoding) == (3, 10):
+            rank = 3
+        elif platform == 0:
+            rank = 2
+        elif (platform, encoding) == (3, 1):
+            rank = 1
+        else:
+            rank = 0
+        if rank > best_rank:
+            best_rank, best_off = rank, sub
+
+    if best_off is None or len(data) < best_off + 2:
+        return None
+    fmt = int.from_bytes(data[best_off : best_off + 2], "big")
+    if fmt == 12 and len(data) >= best_off + 16:
+        return _cmap_format12(data, best_off)
+    if fmt == 4 and len(data) >= best_off + 14:
+        return _cmap_format4(data, best_off)
+    return None
+
+
 
 class FontBook:
     """字体文件索引与 :class:`ImageFont.FreeTypeFont` 缓存。"""
@@ -327,6 +493,9 @@ class FontBook:
         self._index: dict[str, Path] | None = None
         self._cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
         self._face_cache: dict[Path, int] = {}
+        #: 字体文件 -> 它 cmap 里的码位集合（``None`` 表示读不出）。
+        #: 一个字体只解析一次：中文字体两万多个码位，逐块重解析会明显变慢。
+        self._cmap_cache: dict[tuple[Path, int], frozenset[int] | None] = {}
 
     def _build_index(self) -> dict[str, Path]:
         """递归扫描字体目录，建立 ``小写文件名 -> 路径`` 的索引。
@@ -360,15 +529,24 @@ class FontBook:
             self._index = self._build_index()
         return self._index
 
-    def find(self, lang: str | None) -> Path | None:
-        """为指定语言找一个可用字体文件，找不到返回 ``None``。"""
-        family = family_for_lang(lang)
-        candidates = FONT_CANDIDATES.get(family, ())
+    def _family_font(self, family: str) -> Path | None:
+        """只在该族自己的候选文件名里找，**不回退**。
 
-        for name in candidates:
+        :meth:`find` 要的是"能用的字体"（可以跨族回退），
+        而按字形覆盖选族时要的是"这个族到底有没有"，回退会把答案搅混。
+        """
+        for name in FONT_CANDIDATES.get(family, ()):
             hit = self.index.get(name.lower())
             if hit is not None:
                 return hit
+        return None
+
+    def find(self, lang: str | None) -> Path | None:
+        """为指定语言找一个可用字体文件，找不到返回 ``None``。"""
+        family = family_for_lang(lang)
+        hit = self._family_font(family)
+        if hit is not None:
+            return hit
 
         # 该族没命中时，按 cjk -> latin 顺序回退（覆盖面优先）
         for fallback_family in ("cjk", "latin"):
@@ -386,6 +564,147 @@ class FontBook:
             logger.error("未找到匹配字体，使用任意可用字体 %s（字形很可能全部错乱）", name)
             return path
         return None
+
+    def codepoints(self, path: Path, family: str | None = None) -> frozenset[int] | None:
+        """该字体 cmap 覆盖的码位集合；读不出返回 ``None``（当作"不知道"）。"""
+        face = self._face_index(path, family or "cjk")
+        key = (path, face)
+        if key in self._cmap_cache:
+            return self._cmap_cache[key]
+        cps: frozenset[int] | None
+        try:
+            cps = _cmap_codepoints(path.read_bytes(), face)
+        except OSError as exc:
+            logger.warning("读不出字体 %s 的 cmap：%s", path.name, exc)
+            cps = None
+        self._cmap_cache[key] = cps
+        return cps
+
+    def missing_chars(self, lang: str | None, sample: str) -> str:
+        """``sample`` 里该语言字体覆盖不到的字（去重保序，最多 24 个）。
+
+        返回空串有两种含义，调用方都不需要区分：全都有字形，或者字体文件
+        读不出来（此时不敢断言缺字，宁可不报）。
+        """
+        if not sample:
+            return ""
+        family = family_for_lang(lang)
+        unique = list(dict.fromkeys(sample))
+        path = self._family_font(family)
+        if path is None:
+            # 连字体都没有：这些字必然全画成方框，如实报出来
+            return "".join(c for c in unique if not c.isspace())[:_MAX_MISSING_REPORT]
+        cps = self.codepoints(path, family)
+        if cps is None:
+            return ""
+        missing = [c for c in unique if not c.isspace() and ord(c) not in cps]
+        return "".join(missing[:_MAX_MISSING_REPORT])
+
+    def _family_order(self, base: str) -> list[str]:
+        """按"最适合顶替"的顺序排列字体族。
+
+        latin（DejaVu）排第二：它带希腊、西里尔、格鲁吉亚、亚美尼亚，
+        是多数非 CJK 文字的合理替代；CJK 排最后——它虽然覆盖拉丁，但缺
+        上述所有文字，而且拿中文字形画外文很难看。
+        """
+        order = [base]
+        for family in ("latin", *FONT_CANDIDATES):
+            if family == "cjk" or family in order:
+                continue
+            order.append(family)
+        if "cjk" not in order:
+            order.append("cjk")
+        return order
+
+    def resolve_family(self, lang: str | None, sample: str = "") -> str:
+        """按**译文实际用到的字符**挑字体族，而不是只看语言码。
+
+        原因：语言码→族的映射是张静态表，猜错时 Pillow 不会报错，只会把
+        OCR 不认识的码位全画成 ``.notdef`` 方框（实测：缺格鲁吉亚字体时
+        ``გამარჯობა`` 的 9 个字渲染成 9 个一模一样的 □）。日志里那句
+        "字形可能不理想"也完全掩盖了严重性。
+
+        所以拿到译文后核对一遍覆盖：
+        1. 本族字体覆盖全部字符 -> 用本族（绝大多数情况，零变化）；
+        2. 否则按 :meth:`_family_order` 找第一个能全覆盖的族（并说明换了谁）；
+        3. 都不全覆盖 -> 选覆盖最多的族，把缺的字**明确报出来**，
+           交给上层写进块报告（调用方看得见，而不是只在日志里）。
+        """
+        base = family_for_lang(lang)
+        needs = [c for c in dict.fromkeys(sample) if not c.isspace()]
+        if not needs:
+            return base
+
+        for family in self._family_order(base):
+            path = self._family_font(family)
+            if path is None:
+                continue
+            cps = self.codepoints(path, family)
+            if cps is None:
+                # 读不出 cmap 就别拦：宁可保持原行为，也不要因为解析器失手换字体
+                return family
+            if all(ord(c) in cps for c in needs):
+                if family != base:
+                    logger.warning(
+                        "语言 %s 的字体族 %s 缺字形，改用 %s（%s）绘制",
+                        lang,
+                        base,
+                        family,
+                        path.name,
+                    )
+                return family
+
+        best_family, best_path, best_cps, best_covered = base, None, None, -1
+        for family in self._family_order(base):
+            path = self._family_font(family)
+            if path is None:
+                continue
+            cps = self.codepoints(path, family)
+            if cps is None:
+                continue
+            covered = sum(1 for c in needs if ord(c) in cps)
+            if covered > best_covered:
+                best_family, best_path, best_cps, best_covered = family, path, cps, covered
+
+        missing = "".join(
+            c for c in needs if best_cps is not None and ord(c) not in best_cps
+        )[:_MAX_MISSING_REPORT]
+        logger.error(
+            "语言 %s 有 %d/%d 个字符没有任何字体覆盖（用 %s 绘制，缺：%s）。"
+            "这些字会被画成方框，请安装对应字体后重启"
+            "（Linux: apt install fonts-noto-core；或设 IMGTRANS_FONT_DIRS）",
+            lang,
+            len(needs) - max(best_covered, 0),
+            len(needs),
+            best_path.name if best_path else "无",
+            missing or "未知",
+        )
+        return best_family
+
+    def check_langs(self, langs: Iterable[str]) -> list[str]:
+        """部署自检：这些目标语言在本机能不能画出来。
+
+        只对**每种族的代表字**做一次覆盖判断，不做逐字检查（真实译文在
+        :func:`render_blocks` 里还会再核对一遍）。这样启动时就能看出
+        "这台机器缺哪个文字的字体"，而不是等用户传一张格鲁吉亚语的图、
+        拿到一排方框才发现。
+
+        Returns:
+            画不出来的语言的说明列表；空列表表示全部可用。
+        """
+        problems: list[str] = []
+        for lang in langs:
+            family = family_for_lang(lang)
+            probe = FONT_PROBE_TEXT.get(family, "")
+            if not probe:
+                continue  # 没有探针的族不判（宁可不报，也不要误报）
+            resolved = self.resolve_family(lang, probe)
+            missing = self.missing_chars(resolved, probe)
+            if missing:
+                problems.append(
+                    f"{lang}（{family}）：没有字体能画 {probe!r}，缺 {missing}"
+                )
+        return problems
 
     @staticmethod
     def _report_fallback(lang: str | None, family: str, fallback: str, name: str) -> None:

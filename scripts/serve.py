@@ -146,6 +146,7 @@ def main() -> int:
     from imgtrans.api.app import create_app
     from imgtrans.pipeline import ImageTranslatePipeline, PipelineConfig
     from imgtrans.translator import build_translator, mask_proxy
+    from imgtrans.translator.lang_map import SUPPORTED_LANGS
 
     logging.info("推理设备 %s（配置值：%s）", device, args.device)
 
@@ -249,6 +250,23 @@ def main() -> int:
         # 预热交给 app 的 startup 钩子统一做：两处都调的话 --no-warmup
         # 只跳过了这里那次，startup 里还会照热一遍（真踩过）。
         # proxy 显式传下去：/v1/translate/img 传 URL 时要用它下载图片
+
+        # 字体自检：语言码能映射到字体族，不代表本机真有能画出这些文字的
+        # 字体。缺字体时 Pillow 不报错、不抛异常，只把整段文字画成一排 □
+        # （ka 就是这样：只装了中文字体的机器上，格鲁吉亚文全是方框）。
+        # 放在启动阶段说清楚，好过等用户传图过来才发现。
+        problems = pipeline.font_book.check_langs(SUPPORTED_LANGS)
+        if problems:
+            logging.warning(
+                "字体自检：%d/%d 个目标语言在本机画不出来（会渲染成方框）：",
+                len(problems),
+                len(SUPPORTED_LANGS),
+            )
+            for line in problems:
+                logging.warning("  %s", line)
+        else:
+            logging.info("字体自检：%d 个目标语言全部有字体覆盖", len(SUPPORTED_LANGS))
+
         return create_app(pipeline, proxy=args.proxy, warmup=not args.no_warmup)
 
     uvicorn.run(
