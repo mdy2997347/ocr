@@ -19,6 +19,8 @@ import logging
 import os
 import re
 import sys
+import unicodedata
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -366,6 +368,81 @@ def needs_shaping(lang: str | None) -> bool:
         return True
     return family_for_lang(key) in _SHAPING_FAMILIES
 
+
+@dataclass(frozen=True)
+class FontRun:
+    """一段用**同一个字体**绘制的文字（字体回退的最小单位）。
+
+    Pillow 的 ``draw.text`` 一次只认一个字体，没有任何 fallback 机制：
+    字体里没有的字符直接被画成 ``.notdef``（空心方框），不报错。
+
+    而"一个字体覆盖所有脚本"并不存在：Noto Sans Bengali 有孟加拉文和数字，
+    却没有 A~Z；Arial 有 A~Z，没有孟加拉文。所以任何非拉丁语言只要译文里
+    夹了品牌名、型号、单位（`PTM7950`、`(PCM)`、`150°C`、`0.04℃cm2/W`），
+    单字体方案必然在一侧出方框——这不是挑错字体，是无解。
+    """
+
+    text: str
+    font: ImageFont.FreeTypeFont
+
+
+#: 补字时的族优先级。
+#:
+#: 缺的字符绝大多数是拉丁字母与单位符号（品牌名、型号、`°C`、`cm2`、`@`），
+#: 所以 latin 族（Arial/DejaVu）排第一；`℃`/`Ω` 这类合成符号常在 CJK 字体里，
+#: cjk 排第二。其余族按"越专用越靠后"排列，保证顺序确定、结果可复现。
+_FALLBACK_ORDER = (
+    "latin",
+    "cjk",
+    "ja",
+    "ko",
+    "devanagari",
+    "bengali",
+    "th",
+    "ar",
+    "hebrew",
+    "georgian",
+)
+
+#: 码位区间 -> 该文字**自己的**字体族。
+#: 回退时必须先试这个，再走通用顺序：Nirmala.ttf 同时是 devanagari 与
+#: bengali 的候选，若按通用顺序（devanagari 在前），孟加拉字符会被记在
+#: devanagari 名下——画出来是对的（同一个文件），但整形判定、缓存键与
+#: 日志全都说错了文字种类，排查时会被带到沟里。
+_SCRIPT_FAMILY_RANGES: tuple[tuple[int, int, str], ...] = (
+    (0x0980, 0x09FF, "bengali"),
+    (0x0900, 0x097F, "devanagari"),
+    (0x0E00, 0x0E7F, "th"),
+    (0x0590, 0x05FF, "hebrew"),
+    (0x0600, 0x06FF, "ar"),
+    (0x0750, 0x077F, "ar"),
+    (0x08A0, 0x08FF, "ar"),
+    (0x10A0, 0x10FF, "georgian"),
+    (0x3040, 0x30FF, "ja"),
+    (0xAC00, 0xD7AF, "ko"),
+    (0x4E00, 0x9FFF, "cjk"),
+    (0x3400, 0x4DBF, "cjk"),
+    (0x0041, 0x024F, "latin"),  # 拉丁（含扩展附加符号）
+    (0x0370, 0x03FF, "latin"),  # 希腊
+    (0x0400, 0x04FF, "latin"),  # 西里尔
+)
+
+
+def _script_family(code: int) -> str | None:
+    """字符所属文字对应的字体族；认不出来返回 ``None``。"""
+    for lo, hi, family in _SCRIPT_FAMILY_RANGES:
+        if lo <= code <= hi:
+            return family
+    return None
+
+
+#: 必须**跟着基字换字体**的字符类别：组合记号（元音符号、声调、附标）。
+#:
+#: 这些字符单独没有意义，脱离基字就画不出来；更要紧的是整形（Raqm）
+#: 要靠"基字+记号"一起才能算出连字与记号位置。若把 `ि` 分给另一个字体，
+#: HarfBuzz 只能把它当孤立字符，元音会跑到辅音右侧——字都在、拼写是错的。
+_FOLLOW_PREV_CATEGORIES = frozenset({"Mn", "Mc", "Me"})
+
 #: .ttc 里按 face 名挑字形所需的 token。
 #:
 #: Linux 的 ``NotoSansCJK-Regular.ttc`` 把 JP/KR/SC/TC/HK 五个字面打进同一个
@@ -642,6 +719,36 @@ class FontBook:
         missing = [c for c in unique if not c.isspace() and ord(c) not in cps]
         return "".join(missing[:_MAX_MISSING_REPORT])
 
+    def uncovered_chars(self, lang: str | None, sample: str) -> str:
+        """**任何**字体都画不出来的字（把回退链算进去），最多 24 个。
+
+        和 :meth:`missing_chars` 的区别很关键：后者只看本族，回答"本族缺
+        什么"；渲染现在会按字符回退到别的族，所以"本族缺"不等于"画不出来"。
+        响应里的警告必须看这个——否则混排文本（孟加拉译文里夹 `PTM`）会被
+        误报成缺字形，用户去装了字体也没用，真正的问题是回退没兜住。
+        """
+        if not sample:
+            return ""
+        primary = family_for_lang(lang)
+        unique = [c for c in dict.fromkeys(sample) if not c.isspace()]
+        candidates = [primary, *(f for f in _FALLBACK_ORDER if f != primary)]
+        cmaps: list[frozenset[int]] = []
+        for family in candidates:
+            path = self._family_font(family)
+            if path is None:
+                continue
+            cps = self.codepoints(path, family)
+            if cps:
+                cmaps.append(cps)
+        if not cmaps:
+            # 一个候选字体都没命中（机器上只有名字对不上的字体），连"能不能
+            # 回退"都无从判断——退回只看本族的旧判定，至少把本族缺的字报出来。
+            return self.missing_chars(lang, sample)
+        missing = [
+            c for c in unique if not any(ord(c) in cps for cps in cmaps)
+        ]
+        return "".join(missing[:_MAX_MISSING_REPORT])
+
     def _family_order(self, base: str) -> list[str]:
         """按"最适合顶替"的顺序排列字体族。
 
@@ -669,8 +776,10 @@ class FontBook:
         所以拿到译文后核对一遍覆盖：
         1. 本族字体覆盖全部字符 -> 用本族（绝大多数情况，零变化）；
         2. 否则按 :meth:`_family_order` 找第一个能全覆盖的族（并说明换了谁）；
-        3. 都不全覆盖 -> 选覆盖最多的族，把缺的字**明确报出来**，
-           交给上层写进块报告（调用方看得见，而不是只在日志里）。
+        3. 都不全覆盖 -> 选覆盖最多的族当**主字体**。这不是错误：混排文本
+           （孟加拉译文里夹 `PTM7950`）没有任何单一字体能两样都有，渲染层会
+           按字符切成多段、各用各的字体补上。真正画不出来的字由
+           :meth:`uncovered_chars` 判定并上报。
         """
         base = family_for_lang(lang)
         needs = [c for c in dict.fromkeys(sample) if not c.isspace()]
@@ -696,7 +805,7 @@ class FontBook:
                     )
                 return family
 
-        best_family, best_path, best_cps, best_covered = base, None, None, -1
+        best_family, best_path, best_covered = base, None, -1
         for family in self._family_order(base):
             path = self._family_font(family)
             if path is None:
@@ -706,20 +815,17 @@ class FontBook:
                 continue
             covered = sum(1 for c in needs if ord(c) in cps)
             if covered > best_covered:
-                best_family, best_path, best_cps, best_covered = family, path, cps, covered
+                best_family, best_path, best_covered = family, path, covered
 
-        missing = "".join(
-            c for c in needs if best_cps is not None and ord(c) not in best_cps
-        )[:_MAX_MISSING_REPORT]
-        logger.error(
-            "语言 %s 有 %d/%d 个字符没有任何字体覆盖（用 %s 绘制，缺：%s）。"
-            "这些字会被画成方框，请安装对应字体后重启"
-            "（Linux: apt install fonts-noto-core；或设 IMGTRANS_FONT_DIRS）",
+        # 没有单一字体能覆盖全部字符。这在混排文本里是**正常情况**：孟加拉
+        # 译文里夹 PTM7950，没有任何一个字体同时有这两样字。渲染层会按字符
+        # 切成多段、各用各的字体，所以这里不是错误——真正画不出来的字由
+        # uncovered_chars() 判定，并由 render_blocks 写进响应 warnings。
+        logger.debug(
+            "语言 %s 的 %d 个字符没有单一字体能全覆盖，主字体用 %s，其余按字符回退",
             lang,
-            len(needs) - max(best_covered, 0),
             len(needs),
             best_path.name if best_path else "无",
-            missing or "未知",
         )
         return best_family
 
@@ -740,8 +846,9 @@ class FontBook:
             probe = FONT_PROBE_TEXT.get(family, "")
             if not probe:
                 continue  # 没有探针的族不判（宁可不报，也不要误报）
-            resolved = self.resolve_family(lang, probe)
-            missing = self.missing_chars(resolved, probe)
+            # 用 uncovered_chars 而不是 missing_chars：渲染会按字符回退到别的
+            # 族，这里要回答的是"这台机器组合起来能不能画"，不是"本族缺什么"。
+            missing = self.uncovered_chars(lang, probe)
             if missing:
                 problems.append(
                     f"{lang}（{family}）：没有字体能画 {probe!r}，缺 {missing}"
@@ -832,7 +939,8 @@ class FontBook:
             kwargs: dict[str, object] = {}
             if use_raqm:
                 kwargs["layout_engine"] = ImageFont.Layout.RAQM
-            elif needs_shaping(lang):
+            elif needs_shaping(lang) and lang not in _WARNED_NO_RAQM:
+                _WARNED_NO_RAQM.add(lang)
                 logger.warning(
                     "语言 %s 需要文本整形，但当前 Pillow 没有 Raqm："
                     "字母顺序/元音位置/连字都会不正确（不是缺字形，"
@@ -848,11 +956,191 @@ class FontBook:
         self._cache[key] = font
         return font
 
+    def _cmap_of_font(self, font: ImageFont.FreeTypeFont) -> frozenset[int] | None:
+        """字体对象反查 cmap。Pillow 的 FreeTypeFont 带 ``path``，拿它查缓存。"""
+        path = getattr(font, "path", None)
+        if not path:
+            return None
+        return self.codepoints(Path(path))
+
+    def _fallback_font_for(
+        self, ch: str, size: int
+    ) -> ImageFont.FreeTypeFont | None:
+        """给单个字符找一个真正有它字形的字体。"""
+        code = ord(ch)
+        # 先试"这个字符自己那种文字"的族：孟加拉字符就该记在 bengali 名下，
+        # 不能因为 devanagari 候选（Nirmala）恰好也覆盖它而抢走。
+        preferred = _script_family(code)
+        order = ([preferred] if preferred else []) + [
+            f for f in _FALLBACK_ORDER if f != preferred
+        ]
+        for family in order:
+            path = self._family_font(family)
+            if path is None:
+                continue
+            cps = self.codepoints(path, family)
+            if cps and code in cps:
+                return self.get_font(family, size)
+        return None
+
+    def text_runs(self, text: str, font: ImageFont.FreeTypeFont) -> list[FontRun]:
+        """把一行文字切成若干"同一字体"的段，缺字的段换族补上。
+
+        单字体能覆盖全部字符时返回**一段**，调用方随即走原来的绘制路径——
+        这条很重要：已逐像素调好的回填效果不能因为引入回退而发生变化。
+        """
+        if not text:
+            return []
+        cps = self._cmap_of_font(font)
+        if cps is None:
+            # 读不出 cmap 就当作都覆盖，保持原行为
+            return [FontRun(text, font)]
+
+        # 快路径：整行字符都在这一个字体里（绝大多数行）就直接返回。
+        # 集合子集判断是 C 级循环，比下面逐字符的 Python 循环快一个量级——
+        # _measure 每折一行就要调一次，这点差别会被放大。
+        if {ord(c) for c in text} <= cps:
+            return [FontRun(text, font)]
+
+        size = int(getattr(font, "size", 16))
+        # **按词选字体**，不逐字符：`150°C` 里数字主字体有、`°C` 只有拉丁有，
+        # 逐字符会把一个量值劈成两种字形；`(PCM)` 会变成"( 主字体 + PCM 拉丁
+        # + ) 主字体"，括号与字母风格、字距都对不上。按"能覆盖整个词的最优
+        # 字体"选，切换次数天然最少，外观也最接近原文。
+        pieces: list[tuple[str, ImageFont.FreeTypeFont]] = []
+        prev = font
+        for piece in re.split(r"(\s+)", text):
+            if not piece:
+                continue
+            if piece.isspace():
+                # 空格跟随前一段：它本身哪个字体都有，单独立段只会让字距顿一下
+                pieces.append((piece, prev))
+                continue
+            picked = self._token_font(piece, font, cps, size)
+            if picked is None:
+                # 整词没有任何单一字体覆盖（真正的混排词，如 `বাংলাPTM`）
+                pieces.extend(self._split_token(piece, font, cps, size))
+            else:
+                pieces.append((piece, picked))
+            prev = pieces[-1][1]
+
+        runs: list[FontRun] = []
+        for piece, run_font in pieces:
+            if runs and runs[-1].font is run_font:
+                runs[-1] = FontRun(runs[-1].text + piece, run_font)
+            else:
+                runs.append(FontRun(piece, run_font))
+        return runs
+
+    def _token_family_order(self, token: str) -> list[str]:
+        """一个词里字体族的优先级：先它自己那种文字，再按通用顺序。
+
+        先试自己的文字是为了 `हिन्दी` 不被 devanagari 之外的族抢走；
+        ``PTM7950`` 这种以拉丁开头的词则从 latin 开始，于是整串型号
+        连同数字一起用拉丁字体画，不会出现"PTM 一个字体、7950 另一个"。
+        """
+        preferred: str | None = None
+        for ch in token:
+            if ch.isspace():
+                continue
+            family = _script_family(ord(ch))
+            if family is not None:
+                preferred = family
+                break
+        return ([preferred] if preferred else []) + [
+            f for f in _FALLBACK_ORDER if f != preferred
+        ]
+
+    def _token_fonts(
+        self, token: str, primary: ImageFont.FreeTypeFont, size: int
+    ) -> list[ImageFont.FreeTypeFont]:
+        """这个词可用的字体，按偏好从高到低：主字体 → 本文字族 → 通用顺序。"""
+        fonts = [primary]
+        seen = {getattr(primary, "path", None)}
+        for family in self._token_family_order(token):
+            path = self._family_font(family)
+            if path is None or path in seen:
+                continue
+            seen.add(path)
+            fonts.append(self.get_font(family, size))
+        return fonts
+
+    def _token_font(
+        self,
+        token: str,
+        primary: ImageFont.FreeTypeFont,
+        primary_cps: frozenset[int],
+        size: int,
+    ) -> ImageFont.FreeTypeFont | None:
+        """能覆盖**整个词**的最优字体；没有则返回 ``None``（交给词内兜底）。"""
+        codes = [ord(c) for c in token if not c.isspace()]
+        if all(code in primary_cps for code in codes):
+            return primary
+        for font in self._token_fonts(token, primary, size)[1:]:
+            cps = self._cmap_of_font(font)
+            if cps and all(code in cps for code in codes):
+                return font
+        return None
+
+    def _split_token(
+        self,
+        token: str,
+        primary: ImageFont.FreeTypeFont,
+        primary_cps: frozenset[int],
+        size: int,
+    ) -> list[tuple[str, ImageFont.FreeTypeFont]]:
+        """词内兜底：按"能覆盖最长前缀的字体"贪心切分。
+
+        只有整词没有任何单一字体能画时才会走到这里（`0.04℃cm2/W` 这种没有
+        空格的混排值）。用最长前缀而不是逐字符，是为了**少切**：`℃` 若在 CJK
+        字体里，`0.04℃` 就整段交给 CJK，不会变成 `0.04` 一个字体、`℃` 又一个。
+
+        组合记号（天城/孟加拉/泰文的元音符号与声调）和 ZWJ/ZWNJ **必须**跟着
+        基字走：被分到另一个字体后，整形时连字失效、元音跑到错误的一侧，
+        字都在但拼写是错的——比方框更难发现。
+        """
+        fonts = self._token_fonts(token, primary, size)
+        cmaps = [self._cmap_of_font(f) for f in fonts]
+        n = len(token)
+        out: list[tuple[str, ImageFont.FreeTypeFont]] = []
+        i = 0
+        while i < n:
+            # 初始 0 而不是 1：否则"只覆盖 1 个字符"的字体永远赢不过它，
+            # `℃` 这种主字体没有、只有 CJK 有的符号会被判回主字体画成方框。
+            best_idx, best_len = 0, 0
+            for idx, cps in enumerate(cmaps):
+                j = i
+                while j < n:
+                    ch = token[j]
+                    if cps is None or ch.isspace() or ord(ch) in cps:
+                        j += 1
+                        continue
+                    if j > i and (
+                        unicodedata.category(ch) in _FOLLOW_PREV_CATEGORIES
+                        or ch in "\u200c\u200d"
+                    ):
+                        j += 1  # 记号得跟着基字，不能在这里断
+                        continue
+                    break
+                if j - i > best_len:
+                    best_idx, best_len = idx, j - i
+            if best_len == 0:
+                # 没有任何字体画得出这个字符：只能用主字体画（会出方框），
+                # 缺字由 uncovered_chars 在渲染后统一报出来
+                best_len = 1
+            out.append((token[i : i + best_len], fonts[best_idx]))
+            i += best_len
+        return out
+
 
 #: ``has_raqm()`` 的结果缓存。形态判定在进程生命周期内不变，但
 #: ``features.check`` 每次都要去 dlopen 一遍 FriBiDi，单次 0.05ms，渲染
 #: 循环里按块调用就是白白浪费。测试可把它置回 ``None`` 重新探测。
 _RAQM_AVAILABLE: bool | None = None
+
+#: 已经告警过"缺整形"的语言。混排文本会为每个字号、每段重复取字体，
+#: 不记一下的话日志会被同一句话刷满，真正的告警反而被埋掉。
+_WARNED_NO_RAQM: set[str] = set()
 
 
 def has_raqm() -> bool:

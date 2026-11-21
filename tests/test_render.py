@@ -1066,5 +1066,45 @@ class WrapSafetyTest(unittest.TestCase):
             )
 
 
+class FontFallbackRenderTest(unittest.TestCase):
+    """混排文本要真的画出字，而不是一排方框。
+
+    线上 bn 图里孟加拉文正常、`PTM7950 (PCM) 150°C` 全是方框：孟加拉字体
+    有数字没字母。修复的关键不是换字体（没有字体两样都有），而是在绘制时
+    按字符切段、各用各的字体——这里钉住"确实画出来了"且"不再误报缺字形"。
+    """
+
+    def test_mixed_script_is_rendered_without_missing_warning(self) -> None:
+        from imgtrans.render import fonts as fonts_mod
+        from imgtrans.render.fonts import FontBook
+        from imgtrans.render.text import render_blocks
+
+        fonts_mod._WARNED_NO_RAQM.clear()
+        self.addCleanup(fonts_mod._WARNED_NO_RAQM.clear)
+
+        book = FontBook()
+        if book._family_font("bengali") is None:
+            self.skipTest("本机没有孟加拉字体")
+
+        canvas = np.full((120, 520, 3), 245, dtype=np.uint8)
+        # 原文必须与译文不同，否则 render_blocks 会判定"无需回填"直接跳过
+        blocks = [_block("原文占位", 20, 20, 460, 50)]
+        out, reports = render_blocks(
+            canvas,
+            blocks,
+            ["构建 বাংলা 完成"],
+            [BlockStyle(fg_color=(0, 0, 0), bg_color=(240, 240, 240))],
+            book,
+            "zh",
+        )
+
+        ink = (out < 128).any(axis=2)
+        self.assertGreater(int(ink.sum()), 100, "一个字都没画出来")
+        painted = [r for r in reports if r.painted]
+        self.assertTrue(painted, "应当有块被回填")
+        for report in painted:
+            self.assertNotIn("方框", report.note, f"混排不该报缺字形：{report.note}")
+
+
 if __name__ == "__main__":
     unittest.main()

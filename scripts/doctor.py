@@ -171,8 +171,12 @@ def check_fonts(r: Report) -> None:
         # 判据从"文件名对不对"改成"这些字到底画不画得出来"：
         # 文件名猜不出覆盖。ka 就是活例子——文件名叫 DejaVuSans 也算"专用"，
         # 但如果那台机器装的是个没格鲁吉亚字形的版本，照样一片方框。
+        #
+        # 这里必须用 uncovered_chars 而不是 missing_chars：渲染会按字符回退到
+        # 别的族，只要**某种组合**能画出来就不算缺字。用 missing_chars 会把
+        # "本族缺、但 latin 能补"的情况误判成 FAIL。
         resolved = book.resolve_family(lang, probe) if probe else family
-        missing = book.missing_chars(resolved, probe) if probe else ""
+        missing = book.uncovered_chars(lang, probe) if probe else ""
 
         if missing:
             r.fail(

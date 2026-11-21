@@ -295,17 +295,18 @@ class ResolveFamilyTest(unittest.TestCase):
         self.assertEqual(book.missing_chars("latin", GEO), "")
 
     def test_reports_missing_when_nothing_covers(self) -> None:
-        """谁都画不出来时必须说清楚缺哪些字（这正是用户看到方框的场景）。"""
+        """谁都画不出来时必须说清楚缺哪些字（这正是用户看到方框的场景）。
+
+        报告入口已在引入字体回退时从 ``resolve_family`` 的 ERROR 日志挪到
+        ``uncovered_chars``：前者只负责选主字体，"没有单一字体全覆盖"在混排
+        文本里是常态（孟加拉译文里夹 PTM7950），不该刷 ERROR。
+        """
         cjk = _first_font_lacking(GEO)
         if cjk is None:
             self.skipTest("本机没有缺格鲁吉亚字形的字体")
         book = self._book_with(cjk, cjk.name)
-        with self.assertLogs("imgtrans.render.fonts", level="ERROR") as logs:
-            book.resolve_family("ka", GEO)
-        joined = "\n".join(logs.output)
-        self.assertIn("没有任何字体覆盖", joined)
-        missing = book.missing_chars("ka", GEO)
-        self.assertTrue(missing, "缺字形时 missing_chars 不能返回空")
+        missing = book.uncovered_chars("ka", GEO)
+        self.assertTrue(missing, "缺字形时 uncovered_chars 不能返回空")
         self.assertTrue(set(missing) & set(GEO))
 
     def test_check_langs_flags_undrawable_language(self) -> None:
@@ -313,8 +314,7 @@ class ResolveFamilyTest(unittest.TestCase):
         if cjk is None:
             self.skipTest("本机没有缺格鲁吉亚字形的字体")
         book = self._book_with(cjk, cjk.name)
-        with self.assertLogs("imgtrans.render.fonts", level="ERROR"):
-            problems = book.check_langs(["ka"])
+        problems = book.check_langs(["ka"])
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("ka"))
         self.assertIn("没有字体能画", problems[0])
@@ -352,10 +352,12 @@ class ShapingTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self._orig = fonts._RAQM_AVAILABLE
+        fonts._WARNED_NO_RAQM.clear()
         self.addCleanup(self._restore_raqm)
 
     def _restore_raqm(self) -> None:
         fonts._RAQM_AVAILABLE = self._orig
+        fonts._WARNED_NO_RAQM.clear()
 
     def test_shaping_languages_are_flagged(self) -> None:
         for code in ("bn", "hi", "th", "ar", "he"):
@@ -451,6 +453,188 @@ class ShapedForPaintTest(unittest.TestCase):
 
         fonts._RAQM_AVAILABLE = False
         self.assertEqual(T.shaped_for_paint("hello", False), "hello")
+
+
+class FontFallbackTest(unittest.TestCase):
+    """单字体覆盖不了混排文本，必须按字符换字体。
+
+    线上 bn 图里 `PTM7950` / `(PCM)` / `150°C` 全变方框，孟加拉文却正常——
+    因为 Noto Sans Bengali 有孟加拉文和数字，却没有 A~Z。这不是"挑错了字体"：
+    没有哪个字体同时覆盖两种脚本，只能在绘制层切段。
+    """
+
+    def setUp(self) -> None:
+        self.book = FontBook()
+        fonts._WARNED_NO_RAQM.clear()
+        self.addCleanup(fonts._WARNED_NO_RAQM.clear)
+
+    def _skip_without(self, *families: str) -> None:
+        for family in families:
+            if self.book._family_font(family) is None:
+                self.skipTest(f"本机没有 {family} 字体")
+
+    def test_mixed_text_splits_into_runs(self) -> None:
+        self._skip_without("cjk", "bengali")
+        font = self.book.get_font("zh", 24)
+        runs = self.book.text_runs("构建 বাংলা 完成", font)
+        self.assertGreaterEqual(len(runs), 2, [r.text for r in runs])
+        self.assertEqual("".join(r.text for r in runs), "构建 বাংলা 完成")
+        bengali = [r for r in runs if any(0x980 <= ord(c) <= 0x9FF for c in r.text)]
+        self.assertTrue(bengali, "孟加拉段必须换字体")
+        for run in bengali:
+            self.assertIsNot(run.font, font, "不能继续用中文字体画孟加拉文")
+
+    def test_single_font_text_stays_one_run(self) -> None:
+        """纯拉丁必须只有一段：多切一段就多一次绘制，还可能挪动像素。"""
+        runs = self.book.text_runs("Hello world", self.book.get_font("en", 20))
+        self.assertEqual(len(runs), 1)
+
+    def test_fallback_uses_chars_own_script(self) -> None:
+        """孟加拉字符不能被记在 devanagari 名下（Nirmala 同属两族）。
+
+        记错族名不影响像素，但整形判定与缓存键都跟着错，日志会把人带偏。
+        """
+        self._skip_without("cjk")
+        bengali_path = self.book._family_font("bengali")
+        if bengali_path is None:
+            self.skipTest("本机没有孟加拉字体")
+        runs = self.book.text_runs("বাংলা", self.book.get_font("zh", 24))
+        self.assertTrue(runs)
+        used = os.path.basename(str(getattr(runs[0].font, "path", "")))
+        self.assertEqual(used, os.path.basename(str(bengali_path)))
+
+    def test_uncovered_chars_accounts_for_fallback(self) -> None:
+        """能靠回退补上的字不算缺字——否则用户装了字体也没用。"""
+        self._skip_without("bengali", "cjk")
+        self.assertEqual(self.book.uncovered_chars("bn", "বাংলা PTM7950"), "")
+        # 私用区码位没有任何字体会有，必须报出来
+        self.assertTrue(self.book.uncovered_chars("en", "\U000f0000"))
+
+    def test_rtl_text_is_not_split(self) -> None:
+        """RTL 的 bidi 以整行为单位，切开会让视觉顺序彻底错乱。"""
+        from imgtrans.render import text as T
+
+        self._skip_without("ar")
+        font = self.book.get_font("ar", 20)
+        token = T._BOOK.set(self.book)
+        try:
+            runs = T._runs_for("مرحبا 123", font)
+        finally:
+            T._BOOK.reset(token)
+        self.assertEqual(len(runs), 1)
+
+
+class _FakeFont:
+    """受控字体：只带 ``path`` / ``size`` / ``cps``，不碰真实字库。
+
+    切分策略是纯逻辑，用不着真字体文件；反过来用真字体会让测试依赖
+    "这台机器装了什么"，在 CI 上直接跳过，等于没测。
+    """
+
+    def __init__(self, name: str, cps: str) -> None:
+        self.path = Path("<fake>") / f"{name}.ttf"
+        self.size = 24
+        self.cps = frozenset(ord(c) for c in cps)
+
+
+class WordLevelSplitTest(unittest.TestCase):
+    """切段必须**按词**，不能逐字符。
+
+    线上方框的根因是"单一字体画不了混排"，但切得太碎同样不可接受：
+    `PTM7950` 会拆成 `PTM`+`7950`、`(PCM)` 拆成括号+字母，一个型号在
+    视觉上断成两截，字距与字形风格都对不上原文。这里用受控 cmap 把
+    "脚本字体缺拉丁"的场景固定下来，不依赖本机装了什么字体。
+    """
+
+    #: 天城文脚本字体：整个天城块 + 数字 + 常用标点，**没有 A~Z**。
+    #: 这正是 Linux 上 NotoSansDevanagari / NotoSansThai 的真实形态。
+    DEVANAGARI = "".join(chr(c) for c in range(0x0900, 0x0980)) + "0123456789().,/%"
+    LATIN = "".join(chr(c) for c in range(0x20, 0x7F)) + "°"
+    CJK = "℃中文"
+
+    def setUp(self) -> None:
+        self.book = FontBook()
+        self.latin = _FakeFont("latin", self.LATIN)
+        self.cjk = _FakeFont("cjk", self.CJK)
+
+    def _book(self, primary_cps: str | None = None):
+        primary = _FakeFont("script", primary_cps or self.DEVANAGARI)
+        by_family = {"latin": self.latin, "cjk": self.cjk}
+        for patch in (
+            mock.patch.object(
+                self.book, "_cmap_of_font", lambda f: getattr(f, "cps", None)
+            ),
+            mock.patch.object(
+                self.book,
+                "_family_font",
+                lambda fam: by_family[fam].path if fam in by_family else None,
+            ),
+            mock.patch.object(
+                self.book, "get_font", lambda fam, size: by_family[fam]
+            ),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return primary
+
+    def _fonts_of(self, text: str, runs) -> list:
+        """按字符给出各自落在哪一段（用段内偏移），便于断言"没被切开"。"""
+        out = []
+        for run in runs:
+            out.extend([run.font] * len(run.text))
+        self.assertEqual(len(out), len(text), "切段必须不多不少覆盖整行")
+        return out
+
+    def test_model_number_is_not_split(self) -> None:
+        """`PTM7950` 必须整串一个字体，不能 PTM 一个、7950 另一个。"""
+        primary = self._book()
+        text = "PTM7950 हिन्दी"
+        runs = self.book.text_runs(text, primary)
+        fonts_of = self._fonts_of(text, runs)
+        span = {id(fonts_of[text.index(c)]) for c in "PTM7950"}
+        self.assertEqual(len(span), 1, [(r.text, r.font.path) for r in runs])
+
+    def test_brackets_follow_their_word(self) -> None:
+        """`(PCM)` 的括号不能留在脚本字体里，否则括号与字母风格不一。"""
+        primary = self._book()
+        text = "हिन्दी (PCM) 150"
+        runs = self.book.text_runs(text, primary)
+        fonts_of = self._fonts_of(text, runs)
+        span = {id(fonts_of[i]) for i in range(text.index("("), text.index(")") + 1)}
+        self.assertEqual(len(span), 1, [(r.text, r.font.path) for r in runs])
+
+    def test_value_with_unit_stays_together(self) -> None:
+        """`150°C` 是一个量值，切开后数字与单位会用两种字形。"""
+        primary = self._book()
+        text = "तापमान 150°C"
+        runs = self.book.text_runs(text, primary)
+        fonts_of = self._fonts_of(text, runs)
+        span = {id(fonts_of[i]) for i in range(text.index("150"), text.index("°C") + 2)}
+        self.assertEqual(len(span), 1, [(r.text, r.font.path) for r in runs])
+
+    def test_combining_mark_never_leaves_its_base(self) -> None:
+        """`ि` 必须和 `क` 同段：分到另一个字体后整形算不出连字，元音会跑到右侧。"""
+        # 故意让主字体缺 i-matra（U+093F=ि），同时让拉丁字体"有"它——
+        # 这样逐字符的旧实现一定会把记号分出去，测试才真的钉得住这条约束。
+        primary_cps = self.DEVANAGARI.replace("ि", "").replace("\u093f", "")
+        self.assertNotIn("\u093f", primary_cps)
+        self.latin.cps = self.latin.cps | {ord("\u093f")}
+        primary = self._book(primary_cps)
+        runs = self.book.text_runs("कि", primary)
+        self.assertEqual(len(runs), 1, [(r.text, r.font.path) for r in runs])
+        self.assertIn("\u093f", runs[0].text, "记号不能单独成段")
+
+    def test_token_fallback_minimizes_splits(self) -> None:
+        """无空格混排值只能词内兜底，但也要尽量少切（`℃` 只切一次）。"""
+        primary = self._book()
+        runs = self.book.text_runs("0.04℃cm2/W", primary)
+        self.assertLessEqual(len(runs), 3, [(r.text, r.font.path) for r in runs])
+        self.assertEqual("".join(r.text for r in runs), "0.04℃cm2/W")
+        # `℃` 主字体和拉丁字体都没有，必须落到真有它的 CJK 字体上。
+        # （曾经因为"最长前缀"初值为 1，单字符覆盖永远赢不过，结果又画成方框）
+        holder = [r for r in runs if "℃" in r.text]
+        self.assertTrue(holder, [(r.text, r.font.path) for r in runs])
+        self.assertIn(0x2103, holder[0].font.cps, "℃ 不能用画不出它的字体")
 
 
 if __name__ == "__main__":

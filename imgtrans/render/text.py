@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
 import re
@@ -27,9 +28,16 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from ..types import BlockStyle, RenderedBlock, TextBlock
-from .fonts import FontBook, has_raqm
+from .fonts import FontBook, FontRun, has_raqm
 
 logger = logging.getLogger(__name__)
+
+#: 当前渲染用的字体库。字体回退要按字符查 cmap、再找备用族，这条链路
+#: 藏在 ``_measure`` / ``_paint_horizontal`` 深处，用 ContextVar 传比给
+#: 十几个函数各加一个参数干净，也不会像模块级全局变量那样在并发请求间串。
+_BOOK: contextvars.ContextVar[FontBook | None] = contextvars.ContextVar(
+    "imgtrans_font_book", default=None
+)
 
 #: 超采样倍数。4 倍对 CJK 小字提升明显，8 倍收益递减且内存翻倍。
 SUPERSAMPLE = 4
@@ -263,11 +271,32 @@ class Layout:
 
 
 def _measure(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[float, float]:
-    """测量一行文本的渲染尺寸（不含描边）。"""
+    """测量一行文本的渲染尺寸（不含描边）。
+
+    混排（主字体缺字、需要回退）时按"逐段推进、取墨迹并集"计算：语义与
+    单字体的 ``textbbox`` 一致——宽度是**墨迹**宽度而不是推进宽度，否则
+    居中对齐会因为尾部空白而整体偏左。
+    """
     if not text:
         return 0.0, 0.0
-    bbox = draw.textbbox((0, 0), text, font=font)
-    return float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1])
+    runs = _runs_for(text, font)
+    if len(runs) == 1:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        return float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1])
+
+    x = 0.0
+    left: float | None = None
+    right = 0.0
+    top: float | None = None
+    bottom = 0.0
+    for run in runs:
+        bbox = draw.textbbox((x, 0), run.text, font=run.font)
+        left = bbox[0] if left is None else min(left, float(bbox[0]))
+        right = max(right, float(bbox[2]))
+        top = bbox[1] if top is None else min(top, float(bbox[1]))
+        bottom = max(bottom, float(bbox[3]))
+        x += _advance(draw, run.text, run.font)
+    return float(right - (left or 0.0)), float(bottom - (top or 0.0))
 
 
 #: 阿拉伯文 / 希伯来文等从右向左书写的字符区间。
@@ -291,6 +320,43 @@ def is_rtl_text(text: str) -> bool:
         return False
     rtl_count = sum(1 for ch in letters if any(lo <= ord(ch) <= hi for lo, hi in _RTL_RANGES))
     return rtl_count * 2 >= len(letters)
+
+
+#: 最快的"这串里有没有 RTL 字符"判断：拉丁/中日韩/南亚的码位几乎都小于它，
+#: 先比一次大小就能短路。_measure 每行都要调，值得省这一步。
+_RTL_MIN = min(lo for lo, _ in _RTL_RANGES)
+
+
+def _has_rtl_char(text: str) -> bool:
+    return any(
+        ord(ch) >= _RTL_MIN and any(lo <= ord(ch) <= hi for lo, hi in _RTL_RANGES)
+        for ch in text
+    )
+
+
+def _runs_for(text: str, font) -> list[FontRun]:
+    """按字形覆盖把一行切成若干段；单字体够用时只返回一段。
+
+    RTL 文本**不切**：bidi 重排必须以整行为单位，按字符切开会让视觉顺序
+    彻底错乱。混合脚本的 RTL 回填是另一个量级的问题（见 README 已知限制）。
+
+    先切再判 RTL 是刻意的：单字体能覆盖全行时（绝大多数行）直接返回，
+    省掉一次逐字符的区间扫描。
+    """
+    book = _BOOK.get()
+    if book is None or not text:
+        return [FontRun(text, font)]
+    runs = book.text_runs(text, font)
+    if len(runs) > 1 and _has_rtl_char(text):
+        return [FontRun(text, font)]
+    return runs
+
+
+def _advance(draw: ImageDraw.ImageDraw, text: str, font) -> float:
+    """推进宽度（含字距与整形），用于逐段续接——不是墨迹宽度。"""
+    if not text:
+        return 0.0
+    return float(draw.textlength(text, font=font))
 
 
 def shape_rtl_text(text: str) -> str:
@@ -927,14 +993,35 @@ def _paint_horizontal(
         # （实测 "No repost" 被裁成 "epost"）。夹紧到 patch 内，
         # 宁可让居中略微失准，也不能丢字。
         line_x = min(max(line_x, 0.0), max(0.0, _patch_w * ss - line_w))
-        draw.text(
-            (line_x, start_y + i * line_height),
-            line,
-            font=font,
-            fill=fill,
-            stroke_width=stroke_w,
-            stroke_fill=stroke_fill,
-        )
+        y = start_y + i * line_height
+        runs = _runs_for(line, font)
+        if len(runs) == 1:
+            draw.text(
+                (line_x, y),
+                line,
+                font=font,
+                fill=fill,
+                stroke_width=stroke_w,
+                stroke_fill=stroke_fill,
+            )
+            continue
+
+        # 多字体混排必须按**基线**对齐。默认 anchor="la" 对齐的是各自的
+        # ascender，而不同字体的 ascent 不同——同字号画在同一 y 上，拉丁
+        # 字母会整体偏上或偏下几个像素（孟加拉字体与 Arial 的 ascent 就有差）。
+        base_y = y + font.getmetrics()[0]
+        x = line_x
+        for run in runs:
+            draw.text(
+                (x, base_y),
+                run.text,
+                font=run.font,
+                fill=fill,
+                stroke_width=stroke_w,
+                stroke_fill=stroke_fill,
+                anchor="ls",
+            )
+            x += _advance(draw, run.text, run.font)
 
 
 def _paint_vertical(
@@ -1254,6 +1341,27 @@ def render_blocks(
 ) -> tuple[np.ndarray, list[RenderedBlock]]:
     """把译文批量回填到图中。
 
+    这里只做一件事：把 ``font_book`` 放进 :data:`_BOOK`，让深层的
+    ``_measure`` / ``_paint_horizontal`` 能做字符级字体回退。用 ContextVar
+    而不是参数，是因为这两处被十几条调用链穿过，加参数会污染整条签名。
+    """
+    token = _BOOK.set(font_book)
+    try:
+        return _render_blocks_impl(image_bgr, blocks, translations, styles, font_book, lang)
+    finally:
+        _BOOK.reset(token)
+
+
+def _render_blocks_impl(
+    image_bgr: np.ndarray,
+    blocks: list[TextBlock],
+    translations: list[str],
+    styles: list[BlockStyle],
+    font_book: FontBook,
+    lang: str | None,
+) -> tuple[np.ndarray, list[RenderedBlock]]:
+    """把译文批量回填到图中。
+
     Args:
         image_bgr: 已擦除文字的底图。
         blocks: 文字块（``index`` 为稳定主键）。
@@ -1278,9 +1386,13 @@ def render_blocks(
     # 抛异常，只把不认识的码位全画成一模一样的 □（缺格鲁吉亚字体时整段
     # 格鲁吉亚文就是九个小方框），日志里也只有一句"字形可能不理想"。所以这里
     # 拿译文实际用到的字符核对一遍：能换族就换，换不了就把缺的字带回块报告。
+    #
+    # 注意用 uncovered_chars 而不是 missing_chars：单字体时代"本族缺字"="画不
+    # 出来"，现在缺的字符会按段回退到别的族（孟加拉译文里的 PTM7950），只有
+    # **所有**字体都没有的字才真的会变成方框。
     sample = " ".join(t for t in translations if t)
     family = font_book.resolve_family(lang, sample)
-    missing = font_book.missing_chars(family, sample)
+    missing = font_book.uncovered_chars(family, sample)
     lang = family  # 同一个值继续往下传；下游只用它取字体
 
     # 边缘图只算一次：扩框判断要靠它，逐块算会重复付出 Canny 的代价。
