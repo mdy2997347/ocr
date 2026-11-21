@@ -1169,5 +1169,65 @@ class TkkFetchDisabledTest(unittest.TestCase):
         self.assertEqual(len(transport.home_calls()), 0)
 
 
+class FailureDiagnosticsTest(unittest.TestCase):
+    """失败原因必须说人话（2026-11 线上踩过：报文猜 429/403，实际是超时）。"""
+
+    def test_transport_failure_reports_timeout_not_rate_limit(self) -> None:
+        """传输层超时 → 报文说超时与代理，不能再说"429 被限流"。"""
+
+        def boom(call: Call) -> tuple[int, str]:
+            raise OSError("ConnectTimeout: connect to proxy timed out")
+
+        translator = make_translator(router(api=boom, free=boom))
+        texts = ["apple"]
+
+        self.assertEqual(translator.translate_batch(texts, None, "en"), texts)
+
+        message = translator.last_error or ""
+        self.assertIn("连接失败", message)
+        self.assertIn("超时", message)
+        self.assertIn("未配置代理", message)
+        # 关键：没有任何状态码时不许声称是 429/403
+        self.assertNotIn("HTTP 429", message)
+        self.assertNotIn("被判定为机器人", message)
+
+    def test_http_status_is_named_per_channel(self) -> None:
+        """有状态码就报状态码，两个通道各报各的。"""
+        translator = make_translator(
+            router(api=lambda call: (429, "slow down"), free=lambda call: (403, "bot"))
+        )
+
+        translator.translate_batch(["apple"], None, "en")
+
+        message = translator.last_error or ""
+        self.assertIn("api 通道 HTTP 429", message)
+        self.assertIn("free 通道 HTTP 403", message)
+        self.assertIn("限流", message)
+
+    def test_success_clears_previous_failure(self) -> None:
+        """上一次的失败原因不能留到下一次成功的结果里。"""
+        state = {"fail": True}
+
+        def flaky(call: Call) -> tuple[int, str]:
+            return (500, "boom") if state["fail"] else api_ok(call)
+
+        translator = make_translator(router(api=flaky, free=lambda call: (500, "boom")))
+        translator.translate_batch(["apple"], None, "en")
+        self.assertIsNotNone(translator.last_error)
+
+        state["fail"] = False
+        self.assertEqual(translator.translate_batch(["apple"], None, "en"), ["译:apple"])
+        self.assertIsNone(translator.last_error)
+
+    def test_proxy_is_masked_for_display(self) -> None:
+        """``/healthz`` 与启动日志会展示代理，账号密码必须抹掉。"""
+        translator = GoogleWebTranslator(proxy="http://user:pass@10.0.0.1:3128")
+        self.assertEqual(translator.proxy, "http://***@10.0.0.1:3128")
+
+        plain = GoogleWebTranslator(proxy="http://8.218.237.53:24286")
+        self.assertEqual(plain.proxy, "http://8.218.237.53:24286")
+        self.assertIsNone(GoogleWebTranslator().proxy)
+
+
 if __name__ == "__main__":
     unittest.main()

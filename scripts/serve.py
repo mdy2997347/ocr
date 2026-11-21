@@ -132,7 +132,7 @@ def main() -> int:
 
     from imgtrans.api.app import create_app
     from imgtrans.pipeline import ImageTranslatePipeline, PipelineConfig
-    from imgtrans.translator import build_translator
+    from imgtrans.translator import build_translator, mask_proxy
 
     logging.info("推理设备 %s（配置值：%s）", device, args.device)
 
@@ -214,8 +214,10 @@ def main() -> int:
         getattr(translator, "kind", args.translator),
         "（企业尊享版）" if baidu_premium else "",
         ocr_profile,
-        channel_proxy or "无",
-        args.proxy or "无",
+        # 用翻译器实际生效的代理，而不是配置值：两者不同时（比如自定义
+        # transport、或通道不认这个变量）日志会骗人。同时抹掉账号密码。
+        getattr(translator, "proxy", None) or "无",
+        mask_proxy(args.proxy) or "无",
         "关闭（--dev）" if args.dev else "开启",
     )
 

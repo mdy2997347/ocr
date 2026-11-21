@@ -174,6 +174,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
 
+    # 通道整体失败时结果是"原文占位"，直接打印出来看着像翻译成功（只是没变），
+    # 拿它验证代理/网络会得出完全相反的结论。所以先看 last_error。
+    error = getattr(translator, "last_error", None)
+    if error:
+        print(f"翻译失败：{error}", file=sys.stderr)
+        return 1
+
     if args.plain:
         for line in results:
             sys.stdout.write(f"{line}\n")

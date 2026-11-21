@@ -18,7 +18,7 @@ from typing import Any
 from .baidu import BaiduTranslator
 from .base import BaseTranslator, TranslationError, TranslatorUnavailable
 from .google_cloud import GoogleCloudTranslator
-from .google_web import GoogleWebTranslator
+from .google_web import GoogleWebTranslator, mask_proxy
 from .lang_map import (
     AUTO_LIST,
     BAIDU_LANGS,
@@ -51,6 +51,7 @@ __all__ = [
     "get_translator",
     "is_supported_lang",
     "lookup_auto",
+    "mask_proxy",
     "normalize_lang",
     "target_unavailable_reason",
     "to_baidu_lang",

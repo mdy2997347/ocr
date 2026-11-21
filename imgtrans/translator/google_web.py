@@ -43,7 +43,7 @@ from ._http import LOCAL_ADDRESS_UNSUPPORTED, Transport, _HttpXTransport, _Token
 from .base import TranslationError
 from .google_tk import DEFAULT_TKK, TKKSnapshot, build_tk
 
-__all__ = ["GoogleWebTranslator"]
+__all__ = ["GoogleWebTranslator", "mask_proxy"]
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,24 @@ FREE_RETRY_STATUS: int = 503
 # ``_HttpXTransport`` 已迁到 :mod:`imgtrans.translator._http`（百度和本通道共用）。
 # 这里保留 import 是为了让 ``google_web.XXX`` 这个历史访问路径继续可用——
 # 单测直接按这些名字导入，改名的收益为零。
+
+
+def mask_proxy(proxy: str | None) -> str | None:
+    """抹掉代理地址里的账号密码，供日志与 ``/healthz`` 展示。
+
+    ``http://user:pass@host:3128`` 直接打进日志或接口响应，等于把凭据
+    贴到浏览器和日志系统里；而排查时又必须看到"到底配的是哪个代理、
+    有没有生效"，所以只留协议与主机端口。
+    """
+    if not proxy:
+        return None
+    text = str(proxy).strip()
+    if "@" not in text:
+        return text
+    scheme, _, rest = text.partition("://")
+    if not rest:  # 没写协议，形如 user:pass@host
+        return "***@" + text.rsplit("@", 1)[1]
+    return f"{scheme}://***@{rest.rsplit('@', 1)[1]}"
 
 
 def _normalize_for_match(text: str) -> str:
@@ -336,6 +354,14 @@ class GoogleWebTranslator:
         )
         #: 最近一次 api 通道的 HTTP 状态码，供"是否值得重试"的判断使用。
         self._last_api_status: int | None = None
+        #: 最近一次 api / free 通道**为什么**失败（2026-11 线上踩过：只报
+        #: "两个通道均失败"再附一句 429/403 的猜测，实际是代理没生效导致的
+        #: 连接超时，那句猜测把人带去查限流，白查一轮）。
+        self._last_api_error: str | None = None
+        self._last_free_error: str | None = None
+        #: 实际生效的代理（账号密码已抹除），供日志与 ``/healthz`` 展示。
+        #: 注入自定义 transport 时代理不参与请求，报 ``None`` 才不误导。
+        self.proxy: str | None = mask_proxy(proxy) if transport is None else None
         #: 最近一次 ``translate_batch`` 的整体失败原因；成功后清空。
         #: ``None`` 表示"这一轮翻译没出故障"——注意与"译不出来"不同：
         #: 图里没有可译文字时它也是 ``None``。上层据此区分"正常返回原图"
@@ -374,6 +400,8 @@ class GoogleWebTranslator:
         # 每次批量翻译开头清空：上一次的失败原因不能留在这一次的结果里，
         # 否则一张正常的图会被上一次的 429 误判成故障（反之亦然）。
         self.last_error = None
+        self._last_api_error = None
+        self._last_free_error = None
 
         items = self._normalize_texts(texts)
         if not items:
@@ -571,12 +599,82 @@ class GoogleWebTranslator:
             target,
         )
         if self.last_error is None:
-            status = f"，api 通道最后 HTTP {self._last_api_status}" if self._last_api_status else ""
-            self.last_error = (
-                f"{primary}/{secondary} 两个通道均失败{status}；"
-                f"429 表示出口 IP 被限流，403 表示被判定为机器人"
-            )
+            self.last_error = self._failure_summary(primary, secondary)
         return list(chunk)
+
+    def _failure_summary(self, primary: str, secondary: str) -> str:
+        """拼出可直接照做的失败原因（两个通道各一句 + 代理状态 + 处置提示）。
+
+        2026-11 线上真实踩点：切到 Google 后报"两个通道均失败；429 表示出口 IP
+        被限流，403 表示被判定为机器人"。但报文里连状态码都没有——``_request``
+        是传输层超时抛的错，**根本没收到 HTTP 响应**；那句 429/403 的猜测把
+        排查引向"限流"，而真实原因是代理没生效、直连被丢包。所以这里改成
+        有状态码就说状态码，没有就说传输层异常原文。
+        """
+        reasons = {"api": self._last_api_error, "free": self._last_free_error}
+        parts = [
+            f"{name} 通道 {self._short(reasons.get(name) or '失败，原因未知')}"
+            for name in (primary, secondary)
+        ]
+        parts.append(f"代理 {self.proxy}" if self.proxy else "未配置代理（直连）")
+        hint = self._failure_hint(reasons)
+        if hint:
+            parts.append(hint)
+        return "；".join(parts)
+
+    def _failure_hint(self, reasons: dict[str, str | None]) -> str:
+        """按失败原因给处置提示；两种原因可能同时存在，各给一句。
+
+        认不出来就不猜——猜错方向的提示比没有提示更浪费时间。
+        """
+        joined = " ".join(value or "" for value in reasons.values()).lower()
+        hints: list[str] = []
+        if "timeout" in joined or "timed out" in joined or "超时" in joined:
+            hints.append("超时不等于被限流：多为出口不通或代理不可达，先用 curl -x 验证代理")
+        if "connection reset" in joined or ("connect" in joined and "error" in joined):
+            hints.append("连接被重置/拒绝：确认代理白名单放行本机出口 IP，或代理端口可达")
+        if "429" in joined:
+            hints.append("429 表示出口 IP 被限流，降 QPS 或换出口")
+        if "403" in joined:
+            hints.append("403 表示被判定为机器人，换出口 IP 或改用付费通道")
+        return "；".join(hints)
+
+    @staticmethod
+    def _clean_free_reason(exc: object) -> str:
+        """把 ``free channel http 403`` 规整成 ``HTTP 403``。
+
+        两个通道的原因是并排展示的，一个中文一个英文、一个带通道名一个不带，
+        读起来像两件事。统一成同一形状，容易一眼对比。
+        """
+        detail = " ".join(str(exc).split())
+        prefix = "free channel "
+        if detail.lower().startswith(prefix):
+            detail = detail[len(prefix) :]
+        detail = GoogleWebTranslator._strip_attempts(detail)
+        if detail[:5].lower() == "http ":
+            detail = "HTTP " + detail[5:]
+        return detail
+
+    @staticmethod
+    def _strip_attempts(text: object) -> str:
+        """去掉 ``request failed after 3 attempts: `` 这层包装。
+
+        重试次数对读报错的人没有信息量，"连接失败（3 次尝试）"这种表述还会
+        让人以为问题出在次数上。真正的异常原文（ConnectTimeout / ProxyError…）
+        才是要看的。
+        """
+        flat = " ".join(str(text).split())
+        marker = "attempts: "
+        index = flat.find(marker)
+        if flat.lower().startswith("request failed after") and index >= 0:
+            return flat[index + len(marker) :]
+        return flat
+
+    @staticmethod
+    def _short(text: object, limit: int = 160) -> str:
+        """压成单行并截断，避免把整个 traceback 塞进接口响应。"""
+        flat = " ".join(str(text).split())
+        return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
     def _try_channel(
         self, channel: str, chunk: list[str], source: str, target: str
@@ -645,11 +743,15 @@ class GoogleWebTranslator:
         except TranslationError as exc:
             logger.warning("api request error: %s", exc)
             self._last_api_status = None
+            # 没有状态码就是"一个字节都没收到"：超时、连接被重置、代理拒绝
+            # 隧道都走这里。原文留下来，别让上层只能猜 429/403。
+            self._last_api_error = f"连接失败（{self._strip_attempts(exc)}）"
             return None
 
         self._last_api_status = status
         if status != 200:
             logger.warning("api channel http %s", status)
+            self._last_api_error = f"HTTP {status}"
             if status in (429, 503):
                 self._bucket.penalize(self.RATE_LIMIT_PENALTY)
             return None
@@ -658,10 +760,12 @@ class GoogleWebTranslator:
             payload = json.loads(text)
         except (TypeError, ValueError) as exc:
             logger.warning("api channel returned non-JSON payload: %s", exc)
+            self._last_api_error = "响应不是 JSON"
             return None
 
         if not isinstance(payload, list):
             logger.warning("api channel returned unexpected payload type: %s", type(payload))
+            self._last_api_error = f"响应类型异常（{type(payload).__name__}）"
             return None
         if len(payload) != len(chunk):
             logger.warning(
@@ -669,6 +773,7 @@ class GoogleWebTranslator:
                 len(chunk),
                 len(payload),
             )
+            self._last_api_error = f"译文条数不符（期望 {len(chunk)}，实际 {len(payload)}）"
             return None
 
         translated: list[str] = []
@@ -710,6 +815,13 @@ class GoogleWebTranslator:
             return self._translate_free_batch(chunk, source, target)
         except TranslationError as exc:
             logger.warning("free channel error: %s", exc)
+            detail = self._clean_free_reason(exc)
+            if detail.startswith("HTTP "):
+                self._last_free_error = detail
+            elif "payload" in detail or "sentences" in detail:
+                self._last_free_error = f"响应异常（{detail}）"
+            else:
+                self._last_free_error = f"连接失败（{detail}）"
             return None
 
     def _translate_free_batch(

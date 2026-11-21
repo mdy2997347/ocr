@@ -296,6 +296,12 @@ def create_app(
             last_error = getattr(translator, "last_error", None)
             if last_error:
                 payload["translator_last_error"] = last_error
+            # 代理是否真的生效，只有翻译器自己知道：``.env`` 里写了
+            # IMGTRANS_PROXY，但通道不认这个变量（百度走 IMGTRANS_BAIDU_PROXY）
+            # 或者启动参数把它覆盖掉时，配置值会骗人。2026-11 排查"两个通道
+            # 均失败"就卡在这一步——报文里看不出到底有没有走代理。
+            if hasattr(translator, "proxy"):
+                payload["translator_proxy"] = getattr(translator, "proxy", None) or "none"
         return payload
 
     @app.get("/v1/languages")

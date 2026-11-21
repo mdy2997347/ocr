@@ -229,6 +229,23 @@ sudo bash deploy/install.sh --gpu --user ocr
 
 手工部署与排障见 [docs/ubuntu-deploy.md](docs/ubuntu-deploy.md) 和 [docs/linux-deploy.md](docs/linux-deploy.md)。
 
+### Google 通道报「两个通道均失败」
+
+`E_TRANSLATE` 的 message 会按通道分别给出真实原因，**有状态码就报状态码，
+没有就是连不上**（一个字节都没收到：超时、连接被重置、代理拒绝隧道）。
+别看到这句话就去查限流——先看 message 里是哪种：
+
+| message 里的样子 | 含义 | 怎么查 |
+|---|---|---|
+| `连接失败（ConnectTimeout…）` | 出口不通或代理不可达 | `curl -x <代理> -o /dev/null -w '%{http_code}' --max-time 10 https://www.google.com/generate_204` |
+| `连接失败（…Connection reset…）` | 代理/安全组直接拒绝 | 确认代理白名单放行**本机出口 IP**（`curl -s ifconfig.me` 对一下） |
+| `HTTP 429` | 出口 IP 被限流 | 免费通道 QPS 固定 4、不可配，只能换出口 IP 或切 `baidu` |
+| `HTTP 403` | 被判定为机器人（TKK 轮换也会导致） | 换出口 IP，或改用付费 `cloud` 通道 |
+
+message 末尾会带 `代理 http://…` 或 `未配置代理（直连）`，`/healthz` 的
+`translator_proxy` 也给出**实际生效**的代理（不是 `.env` 里的配置值），
+两者对不上就是配置没被通道采纳——百度通道只认 `IMGTRANS_BAIDU_PROXY`。
+
 ## 已知限制
 
 这些是当前实现的真实边界，接入前值得知道：

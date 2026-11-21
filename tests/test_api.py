@@ -486,6 +486,30 @@ class HealthzContractTest(unittest.TestCase):
         self.assertEqual(payload["translator_trips"], 3)
         self.assertIn("429", payload["translator_last_error"])
 
+    def test_reports_translator_proxy(self) -> None:
+        """代理是否生效要能从探活接口看出来。
+
+        2026-11 线上：``.env`` 里配了代理仍报"两个通道均失败"，报文里看不出
+        请求到底走没走代理，只能翻日志。现在 healthz 直接给出实际生效值，
+        没配就是 ``none``——一眼能区分"配错了"和"配了但没生效"。
+        """
+
+        class WithProxy(FakeTranslator):
+            kind = "web"
+            proxy = "http://8.218.237.53:24286"
+
+        payload = self._healthz(WithProxy({"登录": "Login"}))
+        self.assertEqual(payload["translator_proxy"], "http://8.218.237.53:24286")
+
+        payload = self._healthz(FakeTranslator({"登录": "Login"}))
+        self.assertNotIn("translator_proxy", payload)
+
+        class NoProxy(FakeTranslator):
+            kind = "web"
+            proxy = None
+
+        self.assertEqual(self._healthz(NoProxy({"登录": "Login"}))["translator_proxy"], "none")
+
     def test_reports_fast_ocr_profile(self) -> None:
         """档位必须能从探活接口看出来。
 
