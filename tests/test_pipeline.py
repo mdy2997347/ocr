@@ -510,5 +510,90 @@ class MissingShapingWarningTest(unittest.TestCase):
         return buf.tobytes()
 
 
+class OutputFormatDefaultTest(unittest.TestCase):
+    """默认输出格式必须是 jpeg，且各分支的编码参数不能被悄悄改坏。
+
+    背景：默认曾是 png。对图文型商品页（上方文字 + 照片），无损 PNG 比源图
+    大 2.59 倍（实测 750×1105：源 470 KB -> 1218 KB），而 JPEG q95 4:4:4 是
+    453 KB 且文字边缘无可见退化。体积是线上最容易被投诉的指标，默认值
+    必须钉住，否则一次重构就会退回去。
+    """
+
+    def test_config_defaults_to_jpeg(self) -> None:
+        from imgtrans.pipeline import PipelineConfig
+
+        cfg = PipelineConfig()
+        self.assertEqual(cfg.output_format, "jpeg")
+        self.assertEqual(cfg.output_quality, 95)
+
+    def test_none_format_falls_back_to_jpeg(self) -> None:
+        """``fmt=None`` 不能退到 png，否则和默认值自相矛盾。"""
+        from imgtrans.pipeline import _encode_image
+
+        bgr = np.full((8, 8, 3), 200, dtype=np.uint8)
+        _, mime = _encode_image(bgr, None, 95, None)  # type: ignore[arg-type]
+        self.assertEqual(mime, "image/jpeg")
+
+    def test_save_kwargs_per_format(self) -> None:
+        """用 spy 抓 save 的实参，逐项钉住。
+
+        - jpeg: quality 生效、subsampling=0（文字边缘不出彩色毛边）
+        - png : **不能带 optimize**——实测它更大更慢
+          （1217.6 KB/148ms vs 1210.4 KB/57ms），是纯亏损
+        """
+        from unittest import mock
+
+        from PIL import Image
+
+        from imgtrans.pipeline import _encode_image
+
+        bgr = np.random.default_rng(3).integers(0, 255, (24, 32, 3), dtype=np.uint8)
+        real_save = Image.Image.save
+
+        def spy(fmt: str, quality: int) -> dict:
+            calls: list[dict] = []
+
+            def fake_save(self, fp, **kw):  # noqa: ANN001, ANN202
+                calls.append(kw)
+                return real_save(self, fp, **kw)
+
+            with mock.patch.object(Image.Image, "save", fake_save):
+                _encode_image(bgr, fmt, quality, None)
+            self.assertEqual(len(calls), 1)
+            return calls[0]
+
+        jpeg = spy("jpeg", 95)
+        self.assertEqual(jpeg["quality"], 95)
+        self.assertEqual(jpeg["subsampling"], 0, "4:4:4 不能丢，丢了文字边缘会发毛")
+        self.assertTrue(jpeg["optimize"], "JPEG 的 optimize 有效（453 vs 476 KB）")
+
+        png = spy("png", 95)
+        self.assertNotIn("optimize", png, "PNG 开 optimize 反而更大更慢")
+
+        webp = spy("webp", 95)
+        self.assertEqual(webp["quality"], 95)
+        self.assertEqual(webp["method"], 4)
+
+    def test_quality_is_clamped(self) -> None:
+        from unittest import mock
+
+        from PIL import Image
+
+        from imgtrans.pipeline import _encode_image
+
+        bgr = np.zeros((8, 8, 3), dtype=np.uint8)
+        captured: list[dict] = []
+        real_save = Image.Image.save
+
+        def fake_save(self, fp, **kw):  # noqa: ANN001, ANN202
+            captured.append(kw)
+            return real_save(self, fp, **kw)
+
+        with mock.patch.object(Image.Image, "save", fake_save):
+            _encode_image(bgr, "jpeg", 0, None)
+            _encode_image(bgr, "jpeg", 200, None)
+        self.assertEqual([c["quality"] for c in captured], [1, 100])
+
+
 if __name__ == "__main__":
     unittest.main()

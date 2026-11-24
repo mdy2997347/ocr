@@ -223,7 +223,9 @@ class ApiContractTest(unittest.TestCase):
         resp = client.post("/v1/translate/img", json={"lang": "en", "img": b64})
         self.assertEqual(resp.status_code, 200, resp.text)
         payload = resp.json()
-        self.assertEqual(payload["mime"], "image/png")
+        # 默认输出格式是 jpeg（见 OutputFormatDefaultTest）：
+        # 体积与源图持平，而 png 对照片型内容会大 2~3 倍。
+        self.assertEqual(payload["mime"], "image/jpeg")
         self.assertEqual(payload["blocks"][0]["target"], "Login")
         raw = base64.b64decode(payload["image_base64"])
         arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)

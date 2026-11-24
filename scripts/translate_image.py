@@ -4,10 +4,13 @@
 示例::
 
     # 远程图片
-    python scripts/translate_image.py --url https://example.com/a.jpg --to en --out out.png
+    python scripts/translate_image.py --url https://example.com/a.jpg --to en --out out.jpg
 
     # 本地图片（走 multipart 同一套逻辑，不经过下载器）
-    python scripts/translate_image.py --input ./a.png --to ja --out out.png
+    python scripts/translate_image.py --input ./a.png --to ja --out out.jpg
+
+    # 要无损（再编辑/印刷）时显式指定 png
+    python scripts/translate_image.py --input ./a.png --to ja --format png --out out.png
 
     # 指定代理（本机 Google 需代理）
     python scripts/translate_image.py --input a.png --to ja --proxy http://127.0.0.1:10809
@@ -54,13 +57,24 @@ def main() -> int:
         help="目标语言码（见 imgtrans.translator.SUPPORTED_LANGS），如 en / ja / hr",
     )
     parser.add_argument("--from", dest="source", default=None, help="源语言（默认按目标语言推断 OCR 语言）")
-    parser.add_argument("--out", default=None, help="输出文件路径（默认 out.png）")
+    parser.add_argument("--out", default=None, help="输出文件路径（默认 out.jpg，跟随 --format）")
     parser.add_argument(
         "--proxy",
         default=os.environ.get("IMGTRANS_PROXY") or None,
         help="下载/翻译用的代理（默认取 .env 的 IMGTRANS_PROXY）",
     )
-    parser.add_argument("--format", default="png", choices=["png", "jpeg", "webp"], help="输出格式")
+    parser.add_argument(
+        "--format",
+        default="jpeg",
+        choices=["png", "jpeg", "webp"],
+        help="输出格式。默认 jpeg（q95+4:4:4，体积与源图持平）；png 无损但照片型图大 2~3 倍",
+    )
+    parser.add_argument(
+        "--quality",
+        type=int,
+        default=95,
+        help="jpeg/webp 质量（1-100），默认 95",
+    )
     parser.add_argument(
         "--translator",
         default=os.environ.get("IMGTRANS_TRANSLATOR") or "web",
@@ -114,7 +128,11 @@ def main() -> int:
 
     pipeline = ImageTranslatePipeline(
         translator,
-        config=PipelineConfig(output_format=args.format, device=device),
+        config=PipelineConfig(
+            output_format=args.format,
+            output_quality=args.quality,
+            device=device,
+        ),
     )
 
     started = time.perf_counter()
@@ -148,7 +166,15 @@ def main() -> int:
             print(f"  - {w}")
 
     if not args.dry_run:
-        out = Path(args.out or "out.png")
+        # 默认文件名跟随 --format：格式改成 jpeg 之后还叫 out.png，
+        # 文件内容是 JPEG，很多工具会按扩展名解码失败或误判。
+        ext = "png" if args.format == "png" else ("webp" if args.format == "webp" else "jpg")
+        out = Path(args.out or f"out.{ext}")
+        if args.out and out.suffix.lower().lstrip(".") not in {args.format, "jpg"}:
+            print(
+                f"提示：输出内容是 {args.format}，但文件名是 {out.suffix}",
+                file=sys.stderr,
+            )
         out.write_bytes(result.image)
         print(f"\n已写入 {out.resolve()}")
 

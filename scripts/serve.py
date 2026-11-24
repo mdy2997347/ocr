@@ -100,7 +100,19 @@ def main() -> int:
     )
     parser.add_argument("--workers", type=int, default=1, help="worker 进程数（每个都会加载一份模型）")
     parser.add_argument("--no-warmup", action="store_true", help="跳过模型预热")
-    parser.add_argument("--output-format", default="png", choices=["png", "jpeg", "webp"])
+    parser.add_argument(
+        "--output-format",
+        default="jpeg",
+        choices=["png", "jpeg", "webp"],
+        help="输出格式。默认 jpeg：q95+4:4:4 体积与源图持平，文字边缘不退化；"
+        "png 无损但照片型图片会大 2~3 倍",
+    )
+    parser.add_argument(
+        "--output-quality",
+        type=int,
+        default=95,
+        help="jpeg/webp 质量（1-100）。95 以下体积明显变小，低于 85 文字边缘开始发虚",
+    )
     parser.add_argument(
         "--row-join-gap",
         type=float,
@@ -224,12 +236,16 @@ def main() -> int:
     # 设备确认之后才报监听地址：日志顺序就是启动顺序，
     # 先喊"监听中"再因为设备配错退出，会让人以为服务起过又挂了。
     logging.info(
-        "监听 %s:%s，翻译通道 %s%s，OCR 档位 %s，翻译代理 %s，图片下载代理 %s，鉴权 %s",
+        "监听 %s:%s，翻译通道 %s%s，OCR 档位 %s，输出 %s q%d，翻译代理 %s，图片下载代理 %s，鉴权 %s",
         args.host,
         args.port,
         getattr(translator, "kind", args.translator),
         "（企业尊享版）" if baidu_premium else "",
         ocr_profile,
+        # 报实际的格式与质量：体积是线上最容易被投诉的指标，日志里没有
+        # 这一项就只能靠猜服务到底跑的是 png 还是 jpeg。
+        args.output_format,
+        args.output_quality,
         # 用翻译器实际生效的代理，而不是配置值：两者不同时（比如自定义
         # transport、或通道不认这个变量）日志会骗人。同时抹掉账号密码。
         getattr(translator, "proxy", None) or "无",
@@ -242,6 +258,7 @@ def main() -> int:
             translator,
             config=PipelineConfig(
                 output_format=args.output_format,
+                output_quality=args.output_quality,
                 device=device,
                 ocr_profile=ocr_profile,
                 ocr_det_side_len=args.ocr_det_side_len,

@@ -84,8 +84,22 @@ def should_translate(text: str) -> bool:
 class PipelineConfig:
     """链路配置。生产环境应从 YAML/Pydantic Settings 装配。"""
 
-    #: 输出格式：``png`` 无损（默认）/ ``jpeg`` / ``webp``
-    output_format: str = "png"
+    #: 输出格式：``jpeg``（默认）/ ``webp`` / ``png`` 无损。
+    #:
+    #: 默认从 ``png`` 改成 ``jpeg``，因为实测体积差了一个量级：一张 750×1105
+    #: 的图文商品页（上方文字 + 九宫格照片），源图是 WebP 470 KB，无损 PNG
+    #: 重编码后 1218 KB（**2.59×**），而 JPEG q95 4:4:4 是 453 KB（0.96×，
+    #: 与原图持平）。原因不是"图片被放大了"——像素尺寸分毫未变——而是 PNG
+    #: 对照片纹理几乎没有压缩能力（约 1.47 字节/像素），而源图本身是 0.57
+    #: 字节/像素的有损编码，无损重编码必然膨胀。
+    #:
+    #: 代价是要确认文字边缘不退化。实测把回填后的文字区做 2 倍放大逐像素比对：
+    #: PNG / JPEG q95 4:4:4 / WebP q95 三者肉眼分辨不出，PSNR 42.4 dB。
+    #: 关键在 ``subsampling=0``（4:4:4，不做色度下采样）——色度下采样才是文字
+    #: 边缘出现彩色毛边的真正原因，关掉它比提高 quality 更有效。
+    #:
+    #: 需要无损（再编辑、印刷、二次处理）时显式指定 ``png``。
+    output_format: str = "jpeg"
     #: JPEG/WebP 质量。95 以上 + subsampling=0 才谈得上"保持清晰度"。
     output_quality: int = 95
     #: 低于该置信度的 OCR 结果直接丢弃
@@ -644,10 +658,10 @@ def _encode_image(
 ) -> tuple[bytes, str]:
     """BGR -> 字节。
 
-    默认 PNG 无损：JPEG 即使 q=95 也会在文字边缘产生振铃，
-    而图片翻译的输出主体就是文字，"清晰度"主要靠这一步保住。
+    默认 JPEG q95 4:4:4：体积与源图持平（见 ``PipelineConfig.output_format``），
+    而 4:4:4 不做色度下采样，文字边缘不会出彩色毛边。要无损时显式传 ``png``。
     """
-    fmt = (fmt or "png").lower()
+    fmt = (fmt or "jpeg").lower()
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     image = Image.fromarray(rgb)
 
@@ -679,5 +693,9 @@ def _encode_image(
         )
         return buf.getvalue(), "image/webp"
 
-    image.save(buf, format="PNG", optimize=True, **extra)
+    # PNG 的 optimize=True **不要开**：实测它在 Pillow 下反而更大更慢。
+    # 同一张 750×1105 的图，optimize=False（默认 compress_level=6）1210.4 KB
+    # / 57 ms，optimize=True 1217.6 KB / 148 ms——多花 91 ms、文件大 7 KB。
+    # 它内部会切到 compress_level=9 并重选 filter，对照片型内容并不总是更好。
+    image.save(buf, format="PNG", **extra)
     return buf.getvalue(), "image/png"

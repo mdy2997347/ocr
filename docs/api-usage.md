@@ -199,7 +199,7 @@ open("out.png", "wb").write(base64.b64decode(data["image_base64"]))
 | 字段 | 说明 |
 |---|---|
 | `image_base64` | 翻译后图片，**需要自己 base64 解码再存**；字段名带 `_base64` 就是提醒这个 |
-| `mime` | 输出格式，由 `PipelineConfig.output_format` 决定（默认 `image/png`） |
+| `mime` | 输出格式，由 `PipelineConfig.output_format` 决定（默认 `image/jpeg`） |
 | `blocks[].source` / `.target` | 识别到的原文 / 译文，**已按段落聚合**，可直接落库做双语对照 |
 | `blocks[].painted` | 是否真的画进图里；`false` 表示识别到但没回填（无译文、块太小等） |
 | `blocks[].note` | `painted=false` 时的原因，排查用 |
